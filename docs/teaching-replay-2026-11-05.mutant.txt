@@ -1,0 +1,6 @@
+     Running unittests src/lib.rs (/tmp/sweep/issues/I9/syn122-target/debug/deps/synapse_bench-ff0e3b8f4bedcee0)
+running 1 test
+thread 'conformance::tests::git_suite_cases_pass' (1038101) panicked at crates/synapse-bench/src/conformance.rs:1043:13:
+assertion `left == right` failed: git::fsck_detects_corrupted_object observed exit Some(0)
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 78 filtered out; finished in 0.25s
+rc=101

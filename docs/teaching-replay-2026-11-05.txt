@@ -1,0 +1,26 @@
+# Teaching replay record, 2026-11-05
+
+Repository: `aien-dev/synapse`
+Source revision: `06f27ce4b7557011ee6bcdbd1d5f18420c4c3745` (main; fresh `git clone` into an empty temporary directory, detached at that revision; the documentation branch is a separate checkout)
+Host: `spark-b87b`, Linux 7.0.0-1019-nvidia aarch64
+Tools: rustc 1.98.1 (48a229cea 2026-09-01), cargo 1.98.1 (797e8a9bc 2026-08-05), git 2.43.0
+Invocation: `CARGO_TARGET_DIR=<empty temporary directory> nice -n 19 taskset -c 0-9,15-19 <command>`. The wrapper sets CPU priority and placement only; it does not change the test's assertion.
+
+From the fresh checkout:
+
+```sh
+cargo test --locked --offline --lib -p synapse-bench conformance::tests::git_suite_cases_pass -- --exact
+```
+
+Observed process exit: `0`
+Observed result: 1 named test passed; 78 filtered out
+Raw stdout/stderr: [teaching-replay-2026-11-05.raw.txt](teaching-replay-2026-11-05.raw.txt) (SHA-256 `d4dea82041a812d33b59e46a6874e576011efa8b18afb622ccc2ba62c3df499d`)
+
+Negative control, run in the same throwaway checkout and then reverted with `git checkout -- .`: line 745 of `crates/synapse-bench/src/conformance.rs` (the `std::fs::write` that overwrites the materialized commit object in `fsck_detects_corrupted_object`) was replaced by a no-op, so no object is corrupted. The same command then exits `101`: `git::fsck_detects_corrupted_object observed exit Some(0)`, 0 passed, 1 failed. This shows the test fails when the refusal case cannot see a corrupt object. Excerpt: [teaching-replay-2026-11-05.mutant.txt](teaching-replay-2026-11-05.mutant.txt) (SHA-256 `ecc6d40b893720b256cd44c4f7efb157da0789ef3a2a7a90a7d0256c0bed7dce`)
+
+Source file hashes at the tested revision:
+- `crates/synapse-bench/src/conformance.rs`: SHA-256 `0a959db871e86b882afd7b930aa91d2d067206e14d65efbb565367aa84da7965` (unchanged since the 2026-10-22 replay)
+- `crates/synapse-api/src/lib.rs`: SHA-256 `8ddf5864b205585c8ef1ceb478069ccbeae5baa8e26f3afdaa70ac2fe17b277b`
+- `crates/synapse-git/src/lib.rs`: SHA-256 `166f536999302b42b5a4b54b768801463aa63f7345a8083ddb1f72f16e3c066e`
+
+Limits: `--offline` needs the locked crates already in the local cargo registry; on a host without them, drop `--offline` for the first run. This is a host fixture, not a live Radicle promotion, a service deployment or physical hardware qualification. No model was loaded. The 2026-10-22 record in [TEACHING-REPLAY.txt](../TEACHING-REPLAY.txt) is kept unchanged.
