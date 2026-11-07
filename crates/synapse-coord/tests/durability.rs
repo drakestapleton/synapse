@@ -24,6 +24,19 @@
 //!   writers: a registration or a first read retried while the root sync still fails is an
 //!   error; after the repair it succeeds and the marker is gone.
 //!
+//! Round 12 review findings of the same pull request:
+//!
+//! - N3: an empty or missing `journal.log` under a `journal.idx` that names committed
+//!   events is refused (twice, both files unchanged, no id reused), same boot and after a
+//!   reboot; a generation-mismatch rebuild must reach the table's last committed id. A
+//!   compaction cut between its renames still recovers (controls).
+//! - N4: a first delivery retried while its cursor's directory sync still fails is an
+//!   error; after the repair it succeeds, and a delivery with nothing pending needs no
+//!   directory sync.
+//! - N5: a root sync that succeeded earlier never clears the `dirsync.pending` of a later
+//!   publication whose own sync failed (a deterministic two-process interleaving through
+//!   the `pause-after-root-sync` barrier), plus a serial retry control.
+//!
 //! Permission-based cases make a directory unreadable (mode 0300: entries can still be
 //! created, renamed and opened by name, but the directory cannot be opened or listed). The
 //! superuser bypasses that, so those cases print `NOT_RUN` and return when run as uid 0.
@@ -786,4 +799,428 @@ fn r6_first_read_with_a_pending_root_sync_still_failing_is_an_error() {
     assert_eq!(b.deliver("sb", 10, Resume::Acked).unwrap().events.len(), 1);
     assert!(fs::symlink_metadata(&pending).is_err());
     assert!(b.cursor("beta").unwrap().exists);
+}
+
+// ---------------------------------------------------------------------------------------
+// Round 12 helpers.
+
+/// The board CLI with the inherited test variables removed and `env` applied (no boot id
+/// override unless `env` sets one).
+fn cli_cmd(root: &Path, session: Option<&str>, args: &[&str], env: &[(&str, &str)]) -> Command {
+    let mut c = Command::new(BIN);
+    c.arg("board").arg("--board-root").arg(root);
+    if let Some(s) = session {
+        c.arg("--session").arg(s);
+    }
+    c.args(args)
+        .env_remove("SYNAPSE_COORD_FAULT")
+        .env_remove("SYNAPSE_COORD_PAUSE_DIR")
+        .env_remove("SYNAPSE_BOARD_ID")
+        .env_remove("SYNAPSE_BOARD_SESSION")
+        .env_remove("CRUMB_SESSION")
+        .env_remove("SYNAPSE_BOARD_BOOT_ID")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    for (k, v) in env {
+        c.env(k, v);
+    }
+    c
+}
+
+fn cli(root: &Path, session: Option<&str>, args: &[&str], env: &[(&str, &str)]) -> Output {
+    cli_cmd(root, session, args, env).output().unwrap()
+}
+
+fn show(o: &Output) -> String {
+    format!(
+        "exit {:?}: {} {}",
+        o.status.code(),
+        String::from_utf8_lossy(&o.stdout),
+        String::from_utf8_lossy(&o.stderr)
+    )
+}
+
+/// Exit status 1 with an `Io` failure summary (no receipt).
+fn assert_io_cli(o: &Output, what: &str) {
+    assert_eq!(o.status.code(), Some(1), "{what}: {}", show(o));
+    assert_eq!(
+        summary(o).str_of("error").as_deref(),
+        Some("Io"),
+        "{what}: {}",
+        show(o)
+    );
+}
+
+// ---------------------------------------------------------------------------------------
+// N3: an empty or missing journal never erases what journal.idx proves committed.
+
+/// `journal.log` cut to zero bytes (`empty`) or removed; `journal.idx` left intact.
+fn lose_journal(root: &Path, empty: bool) {
+    let jp = root.join("journal.log");
+    if empty {
+        fs::write(&jp, b"").unwrap();
+    } else {
+        fs::remove_file(&jp).unwrap();
+    }
+}
+
+/// The journal (None when missing), the table and the boot record, byte for byte.
+type BoardFiles = (Option<Vec<u8>>, Vec<u8>, Option<Vec<u8>>);
+
+fn files(root: &Path) -> BoardFiles {
+    (
+        fs::read(root.join("journal.log")).ok(),
+        fs::read(root.join("journal.idx")).unwrap(),
+        fs::read(root.join("boot")).ok(),
+    )
+}
+
+#[test]
+fn n3_same_boot_empty_or_missing_journal_is_refused_with_the_table_kept() {
+    for empty in [true, false] {
+        let (f, b) = fx(if empty { "n3-empty" } else { "n3-missing" });
+        b.register("sa", "alpha", None).unwrap();
+        for i in 1..=3 {
+            assert_eq!(post(&b, "sa", &[], &format!("event {i}")).unwrap(), i);
+        }
+        lose_journal(&f.root, empty);
+        let before = files(&f.root);
+        assert_eq!(before.1.len(), 192, "the intact three-entry table");
+        for attempt in 1..=2 {
+            let r = b.recover();
+            assert!(
+                is_corrupt(&r),
+                "empty={empty} attempt {attempt}: expected Corrupt, got {r:?}"
+            );
+            assert_eq!(
+                files(&f.root),
+                before,
+                "empty={empty} attempt {attempt}: both files unchanged"
+            );
+        }
+        // A post runs the same recovery: refused, so id 1 is never handed out again.
+        let r = post(&b, "sa", &[], "would reuse id 1");
+        assert!(
+            is_corrupt(&r),
+            "empty={empty} post: expected Corrupt, got {r:?}"
+        );
+        assert_eq!(
+            files(&f.root),
+            before,
+            "empty={empty}: the post wrote nothing"
+        );
+    }
+}
+
+#[test]
+fn n3_boot_rebuild_refuses_an_empty_or_missing_journal_with_the_table_kept() {
+    for empty in [true, false] {
+        let f = reboot_fixture(if empty {
+            "n3-boot-empty"
+        } else {
+            "n3-boot-missing"
+        });
+        lose_journal(&f.root, empty);
+        let before = files(&f.root);
+        assert_eq!(before.1.len(), 192, "the intact three-entry table");
+        for attempt in 1..=2 {
+            let o = board_cli(&f.root, None, &["recover"], "test-boot-two");
+            assert_eq!(
+                o.status.code(),
+                Some(2),
+                "empty={empty} attempt {attempt}: {}",
+                show(&o)
+            );
+            assert_eq!(
+                summary(&o).str_of("error").as_deref(),
+                Some("Corrupt"),
+                "empty={empty} attempt {attempt}"
+            );
+            assert_eq!(
+                files(&f.root),
+                before,
+                "empty={empty} attempt {attempt}: journal, table and boot record unchanged"
+            );
+        }
+        let o = board_cli(
+            &f.root,
+            Some("sa"),
+            &[
+                "post",
+                "--thread",
+                "t",
+                "--topic",
+                "lane/x",
+                "--text",
+                "would reuse id 1",
+            ],
+            "test-boot-two",
+        );
+        assert_eq!(o.status.code(), Some(2), "empty={empty} post: {}", show(&o));
+        assert_eq!(
+            files(&f.root),
+            before,
+            "empty={empty}: the post wrote nothing"
+        );
+    }
+}
+
+/// `board compact --keep-since <keep>` killed between its two renames: the new journal
+/// generation is in place, `journal.idx` is still the old one.
+fn compact_cut_between_renames(root: &Path, keep: u64, boot: Option<&str>) {
+    let keep = keep.to_string();
+    let mut env = vec![("SYNAPSE_COORD_FAULT", "compact-between-renames")];
+    if let Some(b) = boot {
+        env.push(("SYNAPSE_BOARD_BOOT_ID", b));
+    }
+    let o = cli(root, None, &["compact", "--keep-since", &keep], &env);
+    assert_eq!(o.status.code(), Some(86), "{}", show(&o));
+}
+
+#[test]
+fn n3_control_a_compaction_cut_between_its_renames_still_recovers() {
+    // Same boot: the table of the old generation is rebuilt from the new journal.
+    let (f, b) = fx("n3-cut");
+    b.register("sa", "alpha", None).unwrap();
+    for i in 1..=3 {
+        post(&b, "sa", &[], &format!("event {i}")).unwrap();
+    }
+    compact_cut_between_renames(&f.root, 2, None);
+    let r = b.recover().unwrap();
+    assert!(r.table_rebuilt, "{r:?}");
+    assert_eq!(r.torn_tail_at, None, "nothing cut: {r:?}");
+    assert_eq!(b.bounds().unwrap(), (2, 3));
+    assert!(b.check().unwrap().ok());
+    assert_eq!(post(&b, "sa", &[], "event 4").unwrap(), 4, "no id reused");
+    // After a reboot: the rebuild from offset 0 accepts the new generation too.
+    let g = reboot_fixture("n3-cut-boot");
+    compact_cut_between_renames(&g.root, 2, Some("test-boot-one"));
+    let s = ok_cli(&board_cli(&g.root, None, &["recover"], "test-boot-two"));
+    assert_eq!(s.get("rebuilt_after_boot"), Some(&J::True), "{s:?}");
+    assert_eq!(s.get("torn_tail_at"), Some(&J::Null), "nothing cut: {s:?}");
+    assert_eq!(
+        fs::metadata(g.root.join("journal.idx")).unwrap().len(),
+        128,
+        "events 2 and 3 committed"
+    );
+    ok_cli(&board_cli(&g.root, None, &["check"], "test-boot-two"));
+}
+
+#[test]
+fn n3_a_generation_mismatch_rebuild_must_reach_the_tables_last_committed_id() {
+    // A cut compaction leaves the new journal (events 2 and 3) under the old table, which
+    // names event 3 committed. A journal that then ends on the boundary before event 3 has
+    // lost it: the rebuild must not accept that boundary (and hand id 3 out again).
+    let (f, b) = fx("n3-cut-short");
+    b.register("sa", "alpha", None).unwrap();
+    for i in 1..=3 {
+        post(&b, "sa", &[], &format!("event {i}")).unwrap();
+    }
+    compact_cut_between_renames(&f.root, 2, None);
+    truncate_journal_before_frame(&f.root, 1);
+    let before = files(&f.root);
+    for attempt in 1..=2 {
+        let r = b.recover();
+        assert!(
+            is_corrupt(&r),
+            "attempt {attempt}: expected Corrupt, got {r:?}"
+        );
+        assert_eq!(files(&f.root), before, "attempt {attempt}: unchanged");
+    }
+    let r = post(&b, "sa", &[], "would reuse id 3");
+    assert!(is_corrupt(&r), "post: expected Corrupt, got {r:?}");
+    assert_eq!(files(&f.root), before);
+}
+
+// ---------------------------------------------------------------------------------------
+// N4: a first delivery is not a success over an unsynced durable cursor.
+
+#[test]
+fn n4_first_delivery_retry_with_the_cursor_dir_sync_still_failing_is_an_error() {
+    let (f, b) = fx("n4-first");
+    if is_superuser("n4_first_delivery_retry", &f.root) {
+        return;
+    }
+    b.register("sa", "alpha", None).unwrap();
+    b.register("sb", "beta", None).unwrap();
+    post(&b, "sa", &["beta"], "one").unwrap();
+    // The writer created cursors/; beta never read, so it has no durable cursor yet.
+    assert!(fs::symlink_metadata(f.root.join("cursors/beta.json")).is_err());
+    chmod(&f.root.join("cursors"), 0o300);
+    // The first delivery renames beta's cursor into place, then fails its directory sync.
+    // The retry finds the cursor there: it must flush it again, and that still fails.
+    let first = b.deliver("sb", 10, Resume::Acked);
+    let retry = b.deliver("sb", 10, Resume::Acked);
+    chmod(&f.root.join("cursors"), 0o755);
+    assert!(is_io(&first), "first: expected Io, got {first:?}");
+    assert!(
+        is_io(&retry),
+        "retry with the sync still failing: expected Io, got {retry:?}"
+    );
+    // Repaired: the same retry flushes the cursor and delivers.
+    let r = b.deliver("sb", 10, Resume::Acked).unwrap();
+    assert_eq!(r.events.len(), 1, "{r:?}");
+    let c = b.cursor("beta").unwrap();
+    assert!(c.exists && c.acked == 0, "{c:?}");
+}
+
+#[test]
+fn n4_control_a_delivery_with_nothing_pending_needs_no_cursor_dir_sync() {
+    let (f, b) = fx("n4-clean");
+    if is_superuser("n4_control_clean_delivery", &f.root) {
+        return;
+    }
+    b.register("sa", "alpha", None).unwrap();
+    b.register("sb", "beta", None).unwrap();
+    post(&b, "sa", &["beta"], "one").unwrap();
+    assert_eq!(b.deliver("sb", 10, Resume::Acked).unwrap().events.len(), 1);
+    let two = post(&b, "sa", &["beta"], "two").unwrap();
+    // beta's cursor was flushed by its first delivery: a later delivery owes no directory
+    // sync, so an unreadable cursors/ does not fail it.
+    chmod(&f.root.join("cursors"), 0o300);
+    let r = b.deliver("sb", 10, Resume::Delivered);
+    chmod(&f.root.join("cursors"), 0o755);
+    let ids: Vec<u64> = r.unwrap().events.iter().map(|d| d.event.id).collect();
+    assert_eq!(ids, vec![two]);
+}
+
+// ---------------------------------------------------------------------------------------
+// N5: an earlier root sync never clears a later publication's dirsync.pending.
+
+/// alpha posts three events to beta, beta reads and acknowledges them all.
+fn n5_board(name: &str) -> (Fx, Board) {
+    let (f, b) = fx(name);
+    b.register("sa", "alpha", None).unwrap();
+    b.register("sb", "beta", None).unwrap();
+    for i in 1..=3 {
+        post(&b, "sa", &["beta"], &format!("e{i}")).unwrap();
+    }
+    assert_eq!(b.deliver("sb", 10, Resume::Acked).unwrap().events.len(), 3);
+    b.ack("sb", 3).unwrap();
+    (f, b)
+}
+
+fn wait_for(p: &Path, child: &mut std::process::Child, what: &str) {
+    let t0 = std::time::Instant::now();
+    while fs::symlink_metadata(p).is_err() {
+        if let Some(st) = child.try_wait().unwrap() {
+            panic!("{what}: exited ({st}) before reaching the barrier");
+        }
+        assert!(
+            t0.elapsed() < std::time::Duration::from_secs(30),
+            "{what}: never reached the barrier"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+}
+
+#[test]
+fn n5_a_paused_root_sync_never_clears_a_later_failed_publication() {
+    // The reviewer's interleaving, deterministic through the test barrier:
+    //  A (beta's read) reconciles a pending marker: its root fsync succeeds and it pauses
+    //    before clearing the marker;
+    //  B (a compaction) publishes a new generation and its root sync fails (EIO), so its
+    //    marker must stay;
+    //  A resumes;
+    //  C (a post with every directory sync failing) must then sync the root and fail.
+    let (f, b) = n5_board("n5-race");
+    let sig = scratch("n5-race-sig");
+    fs::create_dir_all(&sig.root).unwrap();
+    let pending = f.root.join("dirsync.pending");
+    // An earlier root change whose sync failed.
+    fs::write(&pending, b"").unwrap();
+    let sigdir = sig.root.to_str().unwrap().to_string();
+    let mut a = cli_cmd(
+        &f.root,
+        Some("sb"),
+        &["read"],
+        &[
+            ("SYNAPSE_COORD_FAULT", "pause-after-root-sync"),
+            ("SYNAPSE_COORD_PAUSE_DIR", &sigdir),
+        ],
+    )
+    .spawn()
+    .unwrap();
+    wait_for(&sig.root.join("ready"), &mut a, "reader A");
+    let mut bp = cli_cmd(
+        &f.root,
+        None,
+        &["compact", "--keep-since", "2"],
+        &[("SYNAPSE_COORD_FAULT", "compact-root-sync-eio")],
+    )
+    .spawn()
+    .unwrap();
+    // B must not get through its publication while A is between its sync and its clear.
+    let t0 = std::time::Instant::now();
+    let mut b_done_while_a_paused = false;
+    while t0.elapsed() < std::time::Duration::from_secs(3) {
+        if bp.try_wait().unwrap().is_some() {
+            b_done_while_a_paused = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    fs::write(sig.root.join("go"), b"").unwrap();
+    let ao = a.wait_with_output().unwrap();
+    let bo = bp.wait_with_output().unwrap();
+    assert!(ao.status.success(), "reader A: {}", show(&ao));
+    assert_io_cli(&bo, "compaction B");
+    let marked = fs::symlink_metadata(&pending).is_ok();
+    let co = cli(
+        &f.root,
+        Some("sa"),
+        &["post", "--thread", "t", "--topic", "lane/x", "--text", "C"],
+        &[("SYNAPSE_COORD_FAULT", "dir-sync-eio")],
+    );
+    println!(
+        "B finished while A paused: {b_done_while_a_paused}; marker after A and B: {marked}; C: {}",
+        show(&co)
+    );
+    assert_io_cli(&co, "post C over B's unsynced publication");
+    assert!(marked, "B's failed publication keeps dirsync.pending");
+    assert!(
+        !b_done_while_a_paused,
+        "B published while A was between its root sync and its marker removal"
+    );
+    // Control: with the root sync working, the next post flushes and is acknowledged.
+    assert_eq!(b.bounds().unwrap(), (2, 3), "B's generation is in place");
+    let s = ok_cli(&post_cli(&f.root, "after the repair", None));
+    assert_eq!(s.get("id"), Some(&J::Num(b"4".to_vec())), "{s:?}");
+    assert!(fs::symlink_metadata(&pending).is_err());
+}
+
+#[test]
+fn n5_control_a_failed_publication_is_cleared_only_by_a_successful_root_sync() {
+    let (f, b) = n5_board("n5-serial");
+    let pending = f.root.join("dirsync.pending");
+    let o = cli(
+        &f.root,
+        None,
+        &["compact", "--keep-since", "2"],
+        &[("SYNAPSE_COORD_FAULT", "compact-root-sync-eio")],
+    );
+    assert_io_cli(&o, "compaction");
+    assert!(fs::symlink_metadata(&pending).is_ok());
+    // A reader and a post whose root sync fails: each is an error and the marker stays.
+    for attempt in 1..=2 {
+        let o = cli(
+            &f.root,
+            Some("sb"),
+            &["read"],
+            &[("SYNAPSE_COORD_FAULT", "dir-sync-eio")],
+        );
+        assert_io_cli(&o, &format!("read attempt {attempt}"));
+        assert!(fs::symlink_metadata(&pending).is_ok(), "attempt {attempt}");
+        let o = post_cli(&f.root, "not acknowledged", Some("dir-sync-eio"));
+        assert_io_cli(&o, &format!("post attempt {attempt}"));
+        assert!(fs::symlink_metadata(&pending).is_ok(), "attempt {attempt}");
+    }
+    // A reader whose root sync succeeds discharges the marker; the next post needs none.
+    let o = cli(&f.root, Some("sb"), &["read"], &[]);
+    assert!(o.status.success(), "{}", show(&o));
+    assert!(fs::symlink_metadata(&pending).is_err());
+    let s = ok_cli(&post_cli(&f.root, "e4", None));
+    assert_eq!(s.get("id"), Some(&J::Num(b"4".to_vec())), "{s:?}");
+    assert_eq!(b.bounds().unwrap(), (2, 4));
 }
