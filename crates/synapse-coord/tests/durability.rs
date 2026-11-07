@@ -1224,3 +1224,116 @@ fn n5_control_a_failed_publication_is_cleared_only_by_a_successful_root_sync() {
     assert_eq!(s.get("id"), Some(&J::Num(b"4".to_vec())), "{s:?}");
     assert_eq!(b.bounds().unwrap(), (2, 4));
 }
+
+// Round 13 (#928 review P1): a durability marker whose lookup fails (anything but
+// NotFound) still owes its flush; a failed lookup must never read as "nothing pending".
+
+fn cli_with_fault(root: &Path, session: &str, args: &[&str], fault: Option<&str>) -> Output {
+    let mut c = Command::new(BIN);
+    c.arg("board")
+        .arg("--board-root")
+        .arg(root)
+        .arg("--session")
+        .arg(session)
+        .args(args)
+        .env_remove("SYNAPSE_COORD_FAULT")
+        .env_remove("SYNAPSE_BOARD_ID")
+        .env_remove("SYNAPSE_BOARD_SESSION")
+        .env_remove("CRUMB_SESSION")
+        .env_remove("SYNAPSE_BOARD_BOOT_ID")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    if let Some(p) = fault {
+        c.env("SYNAPSE_COORD_FAULT", p);
+    }
+    c.output().unwrap()
+}
+
+#[test]
+fn r13_unobservable_cursor_marker_is_not_a_flushed_cursor() {
+    let (f, b) = fx("r13-cursor");
+    if is_superuser("r13_unobservable_cursor_marker", &f.root) {
+        return;
+    }
+    b.register("sa", "alpha", None).unwrap();
+    b.register("sb", "beta", None).unwrap();
+    post(&b, "sa", &["beta"], "one").unwrap();
+    let marker = f.root.join("cursors/beta.unsynced");
+    chmod(&f.root.join("cursors"), 0o300);
+    // First delivery: beta's cursor is renamed into place, its directory sync fails, the
+    // marker stays (positive control for the obligation).
+    let first = cli_with_fault(&f.root, "sb", &["read", "--limit", "10"], None);
+    // The marker cannot be looked up (EIO on that one stat) while the sync still fails.
+    let blind = cli_with_fault(
+        &f.root,
+        "sb",
+        &["read", "--limit", "10"],
+        Some("marker-stat-eio:beta.unsynced"),
+    );
+    chmod(&f.root.join("cursors"), 0o755);
+    assert!(
+        !first.status.success(),
+        "first delivery must fail: {first:?}"
+    );
+    assert!(
+        !blind.status.success(),
+        "a delivery that cannot see its cursor marker returned success: {} {}",
+        String::from_utf8_lossy(&blind.stdout),
+        String::from_utf8_lossy(&blind.stderr)
+    );
+    assert!(fs::symlink_metadata(&marker).is_ok(), "marker must be kept");
+    // Repaired directory, no injection: the retry flushes and clears the marker.
+    let ok = cli_with_fault(&f.root, "sb", &["read", "--limit", "10"], None);
+    assert!(ok.status.success(), "repaired retry: {ok:?}");
+    assert!(
+        fs::symlink_metadata(&marker).is_err(),
+        "marker cleared after the flush"
+    );
+}
+
+#[test]
+fn r13_unobservable_root_marker_gives_no_receipt() {
+    let (f, b) = fx("r13-root");
+    b.register("sa", "alpha", None).unwrap();
+    for i in 1..=4 {
+        post(&b, "sa", &[], &format!("e{i}")).unwrap();
+    }
+    // A compaction whose final root sync fails leaves dirsync.pending.
+    let o = compact_cli(&f.root, 3, Some("compact-root-sync-eio"));
+    assert!(
+        !o.status.success(),
+        "compaction with a failed root sync: {o:?}"
+    );
+    let pending = f.root.join("dirsync.pending");
+    assert!(fs::symlink_metadata(&pending).is_ok());
+    // A post that cannot look the marker up must not acknowledge anything.
+    let blind = cli_with_fault(
+        &f.root,
+        "sa",
+        &[
+            "post", "--thread", "t", "--topic", "lane/x", "--text", "blind",
+        ],
+        Some("marker-stat-eio:dirsync.pending"),
+    );
+    assert!(
+        !blind.status.success(),
+        "a post that cannot see dirsync.pending returned a receipt: {}",
+        String::from_utf8_lossy(&blind.stdout)
+    );
+    assert!(
+        fs::symlink_metadata(&pending).is_ok(),
+        "marker must be kept"
+    );
+    // Control: without the injection the post flushes the root and clears the marker.
+    let ok = cli_with_fault(
+        &f.root,
+        "sa",
+        &[
+            "post", "--thread", "t", "--topic", "lane/x", "--text", "seen",
+        ],
+        None,
+    );
+    assert!(ok.status.success(), "control post: {ok:?}");
+    assert!(fs::symlink_metadata(&pending).is_err(), "marker cleared");
+}
