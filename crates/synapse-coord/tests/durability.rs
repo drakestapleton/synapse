@@ -37,6 +37,21 @@
 //!   publication whose own sync failed (a deterministic two-process interleaving through
 //!   the `pause-after-root-sync` barrier), plus a serial retry control.
 //!
+//! Round 14 review findings of the same pull request (a lookup or listing whose error was
+//! read as absence), driven by the `stat-eio:<name>`, `readdir-eio:<name>` and
+//! `readdirent-eio:<name>` fault points of `SYNAPSE_COORD_FAULT`:
+//!
+//! - B1: `init` on an existing board of an old boot whose `journal.log` lookup fails is an
+//!   error with `boot` unchanged, so the next read of the new boot still rebuilds a lost
+//!   inbox entry (fresh-board and existing-board controls).
+//! - B2: a coordination-store discriminator (`dirs`, `STORE_ID`) that cannot be looked up
+//!   is an error, never a board: no `BOARD_ID` is created.
+//! - The audit: a lost journal whose lookups fail creates no journal; the reboot rebuild,
+//!   the torn-tail index cleanup, the compaction trim and `check` refuse (or report) an
+//!   index directory they cannot list; an unlistable `agents/` is no second tag; an
+//!   unlistable coordination `dirs/` keeps an agent's presence and locks; an unanswerable
+//!   target lookup refuses the key instead of keying the file differently.
+//!
 //! Permission-based cases make a directory unreadable (mode 0300: entries can still be
 //! created, renamed and opened by name, but the directory cannot be opened or listed). The
 //! superuser bypasses that, so those cases print `NOT_RUN` and return when run as uid 0.
@@ -1336,4 +1351,458 @@ fn r13_unobservable_root_marker_gives_no_receipt() {
     );
     assert!(ok.status.success(), "control post: {ok:?}");
     assert!(fs::symlink_metadata(&pending).is_err(), "marker cleared");
+}
+
+// ---------------------------------------------------------------------------------------
+// Round 14 (#928 review): a lookup or listing that fails is never "absent" or "empty".
+
+const BOOT_ONE: (&str, &str) = ("SYNAPSE_BOARD_BOOT_ID", "boot-one");
+const BOOT_TWO: (&str, &str) = ("SYNAPSE_BOARD_BOOT_ID", "boot-two");
+
+fn fault(spec: &str) -> (&str, &str) {
+    ("SYNAPSE_COORD_FAULT", spec)
+}
+
+/// Board of boot `boot-one`: alpha (session sa) posted events 1, 2, 3 to beta (sb).
+fn r14_beta_board(name: &str) -> Fx {
+    let f = scratch(name);
+    ok_cli(&cli(&f.root, None, &["init"], &[BOOT_ONE]));
+    ok_cli(&cli(
+        &f.root,
+        Some("sa"),
+        &["register", "alpha"],
+        &[BOOT_ONE],
+    ));
+    ok_cli(&cli(
+        &f.root,
+        Some("sb"),
+        &["register", "beta"],
+        &[BOOT_ONE],
+    ));
+    for i in 1..=3 {
+        let text = format!("e{i}");
+        ok_cli(&cli(
+            &f.root,
+            Some("sa"),
+            &[
+                "post", "--thread", "t", "--topic", "lane/x", "--to", "beta", "--text", &text,
+            ],
+            &[BOOT_ONE],
+        ));
+    }
+    f
+}
+
+/// Derived-index loss as after a power loss: beta's inbox index loses its last id (the
+/// journal and `journal.idx` are intact), the model of tests/board_cli.rs.
+fn lose_last_inbox_id(root: &Path) {
+    let ip = root.join("inbox/beta.idx");
+    let b = fs::read(&ip).unwrap();
+    assert_eq!(b.len(), 24, "three ids");
+    fs::write(&ip, &b[..16]).unwrap();
+}
+
+/// The event ids `read --mine --peek` returns to beta.
+fn beta_reads(root: &Path, env: &[(&str, &str)]) -> Vec<i64> {
+    let o = cli(
+        root,
+        Some("sb"),
+        &["read", "--mine", "--peek", "--limit", "100"],
+        env,
+    );
+    ok_cli(&o);
+    String::from_utf8_lossy(&o.stdout)
+        .lines()
+        .filter_map(|l| json::parse(l.as_bytes()))
+        .filter(|j| j.get("v").is_some())
+        .map(|j| j.long_of("id", -1))
+        .collect()
+}
+
+fn boot_record(root: &Path) -> Option<Vec<u8>> {
+    fs::read(root.join("boot")).ok()
+}
+
+fn assert_cli_error(o: &Output, code: i32, error: &str, what: &str) {
+    assert_eq!(o.status.code(), Some(code), "{what}: {}", show(o));
+    assert_eq!(
+        summary(o).str_of("error").as_deref(),
+        Some(error),
+        "{what}: {}",
+        show(o)
+    );
+}
+
+#[test]
+fn r14_b1_journal_lookup_error_on_init_keeps_the_old_boot_and_the_rebuild() {
+    let f = r14_beta_board("r14-b1");
+    lose_last_inbox_id(&f.root);
+    assert_eq!(boot_record(&f.root).as_deref(), Some(&b"boot-one\n"[..]));
+    // A new boot; init cannot look the journal up. That is not a fresh board.
+    let o = cli(
+        &f.root,
+        None,
+        &["init"],
+        &[BOOT_TWO, fault("stat-eio:journal.log")],
+    );
+    assert_io_cli(&o, "init with an unobservable journal");
+    assert_eq!(
+        boot_record(&f.root).as_deref(),
+        Some(&b"boot-one\n"[..]),
+        "boot must not be marked verified"
+    );
+    // The next uninjected read of the new boot rebuilds: the acknowledged event 3 is back.
+    assert_eq!(beta_reads(&f.root, &[BOOT_TWO]), vec![1, 2, 3]);
+    assert_eq!(boot_record(&f.root).as_deref(), Some(&b"boot-two\n"[..]));
+}
+
+#[test]
+fn r14_b1_controls_fresh_and_existing_board_init() {
+    // Fresh board: no journal (NotFound), so init records its boot.
+    let fresh = scratch("r14-b1-fresh");
+    ok_cli(&cli(&fresh.root, None, &["init"], &[BOOT_ONE]));
+    assert_eq!(
+        boot_record(&fresh.root).as_deref(),
+        Some(&b"boot-one\n"[..])
+    );
+    // Existing board, new boot, ordinary init: the old boot is kept, the next read
+    // rebuilds the lost inbox id and records the new boot.
+    let f = r14_beta_board("r14-b1-existing");
+    lose_last_inbox_id(&f.root);
+    ok_cli(&cli(&f.root, None, &["init"], &[BOOT_TWO]));
+    assert_eq!(boot_record(&f.root).as_deref(), Some(&b"boot-one\n"[..]));
+    assert_eq!(beta_reads(&f.root, &[BOOT_TWO]), vec![1, 2, 3]);
+    assert_eq!(boot_record(&f.root).as_deref(), Some(&b"boot-two\n"[..]));
+}
+
+#[test]
+fn r14_b2_unobservable_store_discriminator_never_becomes_a_board() {
+    let f = scratch("r14-b2");
+    let board_id = |r: &Path| fs::symlink_metadata(r.join("BOARD_ID")).is_ok();
+    // Clean root: a board.
+    let clean = f.root.join("clean");
+    ok_cli(&cli(&clean, None, &["init"], &[]));
+    assert!(board_id(&clean));
+    // Legacy coordination root (dirs/, no STORE_ID): refused, then refused while dirs
+    // cannot be looked up.
+    let legacy = f.root.join("legacy");
+    fs::create_dir_all(legacy.join("dirs")).unwrap();
+    let o = cli(&legacy, None, &["init"], &[]);
+    assert_cli_error(&o, 2, "NotABoard", "legacy root");
+    let o = cli(&legacy, None, &["init"], &[fault("stat-eio:dirs")]);
+    assert_io_cli(&o, "legacy root, dirs unobservable");
+    assert!(!board_id(&legacy), "no BOARD_ID in a coordination root");
+    // Marked store (STORE_ID): the same for its marker, and for both at once.
+    let marked = f.root.join("marked");
+    fs::create_dir_all(marked.join("dirs")).unwrap();
+    fs::write(marked.join("STORE_ID"), b"crumb-coord-store-id/1 x\n").unwrap();
+    let o = cli(&marked, None, &["init"], &[]);
+    assert_cli_error(&o, 2, "NotABoard", "marked store");
+    let o = cli(&marked, None, &["init"], &[fault("stat-eio:STORE_ID")]);
+    assert_cli_error(&o, 2, "NotABoard", "marked store, STORE_ID unobservable");
+    let o = cli(
+        &marked,
+        None,
+        &["init"],
+        &[fault("stat-eio:STORE_ID,stat-eio:dirs")],
+    );
+    assert_io_cli(&o, "marked store, both discriminators unobservable");
+    assert!(!board_id(&marked), "no BOARD_ID in a coordination root");
+    let only_id = f.root.join("only-id");
+    fs::create_dir_all(&only_id).unwrap();
+    fs::write(only_id.join("STORE_ID"), b"crumb-coord-store-id/1 x\n").unwrap();
+    let o = cli(&only_id, None, &["init"], &[fault("stat-eio:STORE_ID")]);
+    assert_io_cli(&o, "store marker only, unobservable");
+    assert!(!board_id(&only_id), "no BOARD_ID in a coordination root");
+    // An uninspectable root is not adopted either, and opening a board refuses the same.
+    let blind = f.root.join("blind");
+    let o = cli(&blind, None, &["init"], &[fault("stat-eio:dirs")]);
+    assert_io_cli(&o, "clean root, dirs unobservable");
+    assert!(!board_id(&blind));
+    let o = cli(&clean, None, &["agents"], &[fault("stat-eio:STORE_ID")]);
+    assert_io_cli(&o, "open with STORE_ID unobservable");
+}
+
+#[test]
+fn r14_lost_journal_whose_lookups_fail_creates_no_journal() {
+    let (f, b) = fx("r14-lost");
+    b.register("sa", "alpha", None).unwrap();
+    for i in 1..=3 {
+        post(&b, "sa", &[], &format!("e{i}")).unwrap();
+    }
+    lose_journal(&f.root, false);
+    let before = files(&f.root);
+    for spec in ["stat-eio:journal.log", "stat-eio:journal.idx"] {
+        let o = cli(
+            &f.root,
+            Some("sa"),
+            &[
+                "post", "--thread", "t", "--topic", "lane/x", "--text", "late",
+            ],
+            &[fault(spec)],
+        );
+        assert_io_cli(&o, spec);
+        assert_eq!(files(&f.root), before, "{spec}: no journal created");
+    }
+    // Control: observable, the lost journal is refused as in N3, still with nothing created.
+    let o = cli(
+        &f.root,
+        Some("sa"),
+        &[
+            "post", "--thread", "t", "--topic", "lane/x", "--text", "late",
+        ],
+        &[],
+    );
+    assert_cli_error(&o, 2, "Corrupt", "lost journal");
+    assert_eq!(files(&f.root), before);
+}
+
+#[test]
+fn r14_reboot_rebuild_that_cannot_list_an_index_dir_keeps_the_old_boot() {
+    let f = r14_beta_board("r14-rebuild");
+    // A derived index no event names (gamma never received anything): the rebuild must
+    // reach it, so it must list inbox/.
+    let stale = f.root.join("inbox/gamma.idx");
+    fs::write(&stale, 2u64.to_le_bytes()).unwrap();
+    for spec in [
+        "readdir-eio:inbox",
+        "readdirent-eio:inbox",
+        "readdir-eio:topics",
+        "readdirent-eio:topics",
+    ] {
+        let o = cli(&f.root, None, &["recover"], &[BOOT_TWO, fault(spec)]);
+        assert_io_cli(&o, spec);
+        assert_eq!(
+            boot_record(&f.root).as_deref(),
+            Some(&b"boot-one\n"[..]),
+            "{spec}: boot must not be marked verified"
+        );
+    }
+    let r = ok_cli(&cli(&f.root, None, &["recover"], &[BOOT_TWO]));
+    assert_eq!(r.get("rebuilt_after_boot"), Some(&J::True), "{r:?}");
+    assert_eq!(fs::read(&stale).unwrap(), b"", "stale index rewritten");
+    ok_cli(&cli(&f.root, None, &["check"], &[BOOT_TWO]));
+    assert_eq!(beta_reads(&f.root, &[BOOT_TWO]), vec![1, 2, 3]);
+}
+
+#[test]
+fn r14_torn_tail_cleanup_that_cannot_list_keeps_the_tail_and_reuses_no_stale_id() {
+    let (f, b) = fx("r14-torn");
+    b.register("sa", "alpha", None).unwrap();
+    b.register("sb", "beta", None).unwrap();
+    for i in 1..=3 {
+        post(&b, "sa", &["beta"], &format!("e{i}")).unwrap();
+    }
+    // A writer died after listing id 4 in beta's inbox and before committing it; its frame
+    // is a torn tail (a 32-byte frame header with 4 body bytes).
+    let ip = f.root.join("inbox/beta.idx");
+    let mut ids = fs::read(&ip).unwrap();
+    ids.extend_from_slice(&4u64.to_le_bytes());
+    fs::write(&ip, &ids).unwrap();
+    let jp = f.root.join("journal.log");
+    let mut j = fs::read(&jp).unwrap();
+    j.extend_from_slice(&[32, 0, 0, 0, 1, 2, 3, 4, b'{', b'"', b'v', b'"']);
+    fs::write(&jp, &j).unwrap();
+    let args = [
+        "post", "--thread", "t", "--topic", "lane/y", "--text", "next",
+    ];
+    for spec in ["readdir-eio:inbox", "readdirent-eio:inbox"] {
+        let o = cli(&f.root, Some("sa"), &args, &[fault(spec)]);
+        assert_io_cli(&o, spec);
+        assert_eq!(
+            fs::read(&jp).unwrap(),
+            j,
+            "{spec}: torn tail kept for the retry"
+        );
+    }
+    // The retry cleans the stale id, cuts the tail and hands id 4 to a post beta is not
+    // addressed by: beta must not receive it.
+    let s = ok_cli(&cli(&f.root, Some("sa"), &args, &[]));
+    assert_eq!(s.long_of("id", -1), 4, "{s:?}");
+    assert_eq!(beta_reads(&f.root, &[]), vec![1, 2, 3]);
+    assert!(b.check().unwrap().ok(), "{:?}", b.check().unwrap().problems);
+}
+
+#[test]
+fn r14_trim_that_cannot_list_is_not_a_successful_compaction() {
+    let (f, b) = fx("r14-trim");
+    b.register("sa", "alpha", None).unwrap();
+    for i in 1..=4 {
+        post(&b, "sa", &[], &format!("e{i}")).unwrap();
+    }
+    let o = compact_cli(&f.root, 3, Some("readdir-eio:topics"));
+    assert_io_cli(&o, "compaction whose trim cannot list topics/");
+    // The new generation was published (durable) before the trim; readers skip the ids
+    // below the base that the topic index still holds.
+    assert_eq!(b.bounds().unwrap(), (3, 4));
+    assert!(b.check().unwrap().ok(), "{:?}", b.check().unwrap().problems);
+    let topic_ids = |root: &Path| -> Vec<u64> {
+        let mut v = Vec::new();
+        for e in fs::read_dir(root.join("topics")).unwrap() {
+            let p = e.unwrap().path();
+            if p.extension().and_then(|x| x.to_str()) == Some("idx") {
+                for c in fs::read(&p).unwrap().chunks(8) {
+                    v.push(u64::from_le_bytes(c.try_into().unwrap()));
+                }
+            }
+        }
+        v
+    };
+    assert_eq!(topic_ids(&f.root), vec![1, 2, 3, 4], "untrimmed");
+    // A later compaction trims everything below its base.
+    for i in 5..=6 {
+        post(&b, "sa", &[], &format!("e{i}")).unwrap();
+    }
+    let o = compact_cli(&f.root, 5, None);
+    assert!(o.status.success(), "{}", show(&o));
+    assert_eq!(topic_ids(&f.root), vec![5, 6]);
+}
+
+#[test]
+fn r14_check_that_cannot_list_does_not_pass() {
+    let (f, b) = fx("r14-check");
+    b.register("sa", "alpha", None).unwrap();
+    b.register("sb", "beta", None).unwrap();
+    post(&b, "sa", &["beta"], "one").unwrap();
+    ok_cli(&cli(&f.root, None, &["check"], &[]));
+    for spec in [
+        "readdirent-eio:inbox",
+        "readdir-eio:inbox",
+        "readdirent-eio:topics",
+        "readdir-eio:topics",
+    ] {
+        let o = cli(&f.root, None, &["check"], &[fault(spec)]);
+        assert_cli_error(&o, 2, "CheckFailed", spec);
+        assert!(
+            String::from_utf8_lossy(&o.stdout).contains("cannot list"),
+            "{spec}: {}",
+            show(&o)
+        );
+    }
+}
+
+#[test]
+fn r14_unlistable_agents_dir_is_no_second_tag() {
+    let (f, b) = fx("r14-agents");
+    b.register("sa", "alpha", None).unwrap();
+    let gamma = f.root.join("agents/gamma.json");
+    for spec in ["readdir-eio:agents", "readdirent-eio:agents"] {
+        let o = cli(&f.root, Some("sa"), &["register", "gamma"], &[fault(spec)]);
+        assert_io_cli(&o, spec);
+        assert!(fs::symlink_metadata(&gamma).is_err(), "{spec}: no binding");
+        let o = cli(&f.root, Some("sa"), &["whoami"], &[fault(spec)]);
+        assert_io_cli(&o, spec);
+    }
+    // Control: the session already holds alpha.
+    let o = cli(&f.root, Some("sa"), &["register", "gamma"], &[]);
+    assert_cli_error(&o, 2, "SessionTagged", "second tag");
+    assert!(fs::symlink_metadata(&gamma).is_err());
+    assert_eq!(b.whoami("sa").unwrap().tag, "alpha");
+}
+
+fn store_cli(store: &Path, top: &Path, args: &[&str], spec: Option<&str>) -> Output {
+    let mut c = Command::new(BIN);
+    c.arg("--store")
+        .arg(store)
+        .arg("--top")
+        .arg(top)
+        .args(args)
+        .env_remove("SYNAPSE_COORD_FAULT")
+        .env_remove("CRUMB_SESSION")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    if let Some(s) = spec {
+        c.env("SYNAPSE_COORD_FAULT", s);
+    }
+    c.output().unwrap()
+}
+
+#[test]
+fn r14_unlistable_store_dirs_keeps_presence_and_locks() {
+    let f = scratch("r14-store");
+    let top = f.root.join("wa");
+    fs::create_dir_all(top.join("src")).unwrap();
+    fs::create_dir_all(top.join("lib")).unwrap();
+    fs::write(top.join("src/a.c"), "a").unwrap();
+    fs::write(top.join("lib/b.c"), "b").unwrap();
+    let store = f.root.join("store/crumb/v1");
+    let cs = CoordStore::open(&store);
+    let ws = Workspace::worktree(top.to_str().unwrap(), Holder::default());
+    for (dir, t) in [("src", "a.c"), ("lib", "b.c")] {
+        match cs.claim(&ws, "agent-a", dir, t, "work", None).unwrap() {
+            ClaimOutcome::Claimed { .. } => {}
+            o => panic!("expected a claim, got {o:?}"),
+        }
+    }
+    let presence = store.join("agents/agent-a.json");
+    assert!(fs::symlink_metadata(&presence).is_ok());
+    let close = ["close", "agent-a", "src", "a.c", "modify"];
+    for spec in ["readdir-eio:dirs", "readdirent-eio:dirs"] {
+        // Closing a.c must see that agent-a still holds lib/b.c in another record.
+        let o = store_cli(&store, &top, &close, Some(spec));
+        assert!(!o.status.success(), "{spec}: {}", show(&o));
+        assert!(
+            fs::symlink_metadata(&presence).is_ok(),
+            "{spec}: presence kept"
+        );
+        let o = store_cli(&store, &top, &["sniff", "agent-a", "."], Some(spec));
+        assert!(!o.status.success(), "{spec}: sniff {}", show(&o));
+    }
+    let o = store_cli(
+        &store,
+        &top,
+        &["sniff", "agent-a", "."],
+        Some("readdir-eio:agents"),
+    );
+    assert!(!o.status.success(), "sniff without agents/: {}", show(&o));
+    let s = cs.sniff(&ws, "agent-a", ".").unwrap();
+    assert_eq!(s.locks.len(), 2, "both locks still held");
+    // Control: the uninjected close releases a.c and keeps the presence (b.c is held).
+    let o = store_cli(&store, &top, &close, None);
+    assert!(o.status.success(), "{}", show(&o));
+    assert!(
+        fs::symlink_metadata(&presence).is_ok(),
+        "agent-a still holds lib/b.c"
+    );
+    assert_eq!(cs.sniff(&ws, "agent-a", ".").unwrap().locks.len(), 1);
+}
+
+#[test]
+fn r14_unanswerable_target_lookup_refuses_the_key() {
+    let f = scratch("r14-key");
+    let top = f.root.join("wa");
+    fs::create_dir_all(top.join("src/x")).unwrap();
+    fs::write(top.join("src/x/a.c"), "a").unwrap();
+    let ws = Workspace::worktree(top.to_str().unwrap(), Holder::default());
+    // Controls: an existing file keys from its directory; a path through a regular file
+    // (ENOTDIR) is absent for every process and keys as written.
+    assert_eq!(ws.target_key("x/a.c", "src").unwrap(), "src/x/a.c");
+    assert_eq!(ws.target_key("a.c/z", "src/x").unwrap(), "a.c/z");
+    // EIO on the lookup: keying it as "x/a.c" would let a second agent, which sees the
+    // file, hold "src/x/a.c" at the same time.
+    let store = f.root.join("store/crumb/v1");
+    let o = store_cli(
+        &store,
+        &top,
+        &["claim", "agent-a", "src", "x/a.c", "work"],
+        Some("stat-eio:a.c"),
+    );
+    assert!(!o.status.success(), "{}", show(&o));
+    assert!(
+        !String::from_utf8_lossy(&o.stdout).contains("CLAIMED"),
+        "{}",
+        show(&o)
+    );
+    let o = store_cli(
+        &store,
+        &top,
+        &["claim", "agent-a", "src", "x/a.c", "work"],
+        None,
+    );
+    assert!(
+        String::from_utf8_lossy(&o.stdout).contains("CLAIMED src/x/a.c"),
+        "{}",
+        show(&o)
+    );
 }
