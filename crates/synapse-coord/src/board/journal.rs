@@ -148,9 +148,13 @@ fn stored_boot_id(root: &Path) -> Result<Option<String>, BoardError> {
 }
 
 /// A board with no journal yet has nothing derived to verify: record this boot so its first
-/// writer does not report a rebuild. Called by `Board::init` under the lock.
+/// writer does not report a rebuild. Called by `Board::init` under the lock, also on an
+/// existing board. Only a journal that is certainly absent (`NotFound`) is fresh: any other
+/// lookup failure is returned with `boot` untouched, because recording this boot over an
+/// existing board would tell its next reader and writer that the derived indexes were
+/// already verified, so the reboot rebuild would be skipped (round 14 of the #928 review).
 pub(crate) fn mark_boot_if_fresh(root: &Path) -> Result<(), BoardError> {
-    if crate::record::lstat(&root.join(JOURNAL)).is_err() {
+    if !present(&root.join(JOURNAL))? {
         if let Some(b) = boot_id() {
             crate::durable_write(root, &root.join(BOOT), format!("{b}\n").as_bytes())?;
         }
@@ -363,6 +367,12 @@ pub(crate) fn marker_stat(p: &Path) -> std::io::Result<()> {
 /// lookup failure is returned, because a marker that cannot be observed may still record
 /// an unsynced publication (round 13 of the #928 review).
 pub(crate) fn marker_present(p: &Path) -> Result<bool, BoardError> {
+    present(p)
+}
+
+/// Whether anything has the name `p` (never following a link). Only `NotFound` is absence;
+/// any other lookup failure is returned as [`BoardError::Io`], never read as "absent".
+pub(crate) fn present(p: &Path) -> Result<bool, BoardError> {
     match marker_stat(p) {
         Ok(()) => Ok(true),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
@@ -501,17 +511,28 @@ impl BoardLock {
 }
 
 /// A coordination store (`STORE_ID`, `dirs/`) is never a board root: the two would share
-/// a `.lock` and an operator could mistake one for the other.
+/// a `.lock` and an operator could mistake one for the other. Each discriminator is
+/// present, certainly absent (`NotFound`) or not observable. Any one present refuses the
+/// root as [`BoardError::NotABoard`]; otherwise the first lookup error is returned, so a
+/// root that cannot be inspected is never adopted (no `BOARD_ID` is created in it; round
+/// 14 of the #928 review). Only when both are certainly absent is it a board root.
 pub(crate) fn refuse_coord_root(root: &Path) -> Result<(), BoardError> {
+    let mut unobservable = None;
     for n in [crate::STORE_ID_FILE, "dirs"] {
-        if crate::record::lstat(&root.join(n)).is_ok() {
-            return Err(BoardError::NotABoard {
-                root: root.to_path_buf(),
-                reason: format!("it has {n}, so it is a Crumb coordination store"),
-            });
+        match present(&root.join(n)) {
+            Ok(true) => {
+                return Err(BoardError::NotABoard {
+                    root: root.to_path_buf(),
+                    reason: format!("it has {n}, so it is a Crumb coordination store"),
+                })
+            }
+            Ok(false) => {}
+            Err(e) => {
+                unobservable.get_or_insert(e);
+            }
         }
     }
-    Ok(())
+    unobservable.map_or(Ok(()), Err)
 }
 
 fn encode_board_id(id: &BoardId) -> Vec<u8> {
