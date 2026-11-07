@@ -1727,12 +1727,24 @@ impl Board {
             ni.write_all(&out).map_err(io_err(&it))?;
             ni.sync_all().map_err(io_err(&it))?;
         }
-        let expired = if expire_cursors {
-            self.expire_cursors(&lagging)?;
-            lagging
-        } else {
-            Vec::new()
-        };
+        // Expire, then flush `cursors/` before anything is published: the decision above
+        // read cursor state (acks, expirations, first reads) that an earlier operation may
+        // have renamed into place without a successful directory sync, and a retry finds
+        // an expiration already applied (the `lagging` filter skips it) without writing it
+        // again. Publishing over a cursor a power loss could still undo would drop events
+        // its reader never acknowledged. A failure refuses here, the journal untouched.
+        let ready = (|| {
+            if expire_cursors {
+                self.expire_cursors(&lagging)?;
+            }
+            self.sync_cursor_dir()
+        })();
+        if let Err(e) = ready {
+            let _ = fs::remove_file(&jt);
+            let _ = fs::remove_file(&it);
+            return Err(e);
+        }
+        let expired = if expire_cursors { lagging } else { Vec::new() };
         // The renames publish the new generation: mark the root before them and sync it
         // after, so a failed sync refuses the compaction and the next writer flushes the
         // root again before it acknowledges a post into the new journal.

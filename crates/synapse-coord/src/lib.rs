@@ -797,8 +797,11 @@ fn durable_write(root: &Path, path: &Path, data: &[u8]) -> Result<(), CoordError
     }
     fault_point("before-rename");
     fs::rename(&tmp, path).map_err(io_err(path))?;
-    // The rename is only durable once the directory is: no success before that. A retry
-    // renames again and so syncs again.
+    // The rename is only durable once the directory is: no success before that. A failed
+    // sync leaves the new record visible, so a caller with an "already applied" path (a
+    // retry that finds the record as it wanted it and writes nothing) must sync the
+    // directory again itself before it reports success (the board's `ack`,
+    // `subscribe`, compaction).
     fsync_dir(dd)
 }
 

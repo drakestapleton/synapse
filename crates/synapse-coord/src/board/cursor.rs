@@ -16,7 +16,7 @@
 
 use super::frame::{as_string, as_u64, compact, j_list, key_hash, num_u64, str_list, H_THREAD};
 use super::journal::{
-    ensure_dir, fcntl_lock, inbox_file, read_ids_after, topic_file, FileLock, Snapshot,
+    ensure_dir, fcntl_lock, fsync_dir, inbox_file, read_ids_after, topic_file, FileLock, Snapshot,
 };
 use super::{
     validate_name, validate_tag, Board, BoardError, Event, Me, MAX_READ_LIMIT, MAX_SUBSCRIPTIONS,
@@ -254,6 +254,9 @@ impl Board {
         } else if !add && had {
             list.retain(|x| x != name);
         } else {
+            // Already applied: flush `subs/` before reporting it (see `ack`), since an
+            // earlier change may have been renamed in without a successful sync.
+            fsync_dir(&self.root().join("subs"))?;
             return Ok(s);
         }
         if s.topics.len() + s.threads.len() > MAX_SUBSCRIPTIONS {
@@ -409,6 +412,11 @@ impl Board {
             return Err(BoardError::AckBeyondCommitted { id, last });
         }
         if c.exists && id <= c.acked {
+            // Already applied, but not necessarily durable: an earlier ack may have renamed
+            // this cursor into place and then failed (or died before) the directory sync.
+            // Sync it again before reporting the cursor, so a retry is never a durable
+            // success over a rename a power loss could still undo.
+            self.sync_cursor_dir()?;
             return Ok(c);
         }
         c.acked = id;
@@ -505,6 +513,17 @@ impl Board {
             self.write_cursor(t, &c)?;
         }
         Ok(())
+    }
+
+    /// Flush `cursors/` (absent: nothing to flush). Every cursor visible in it is then
+    /// durable, including one an earlier ack, first read or expiration renamed into place
+    /// before its own directory sync failed or the process died.
+    pub(crate) fn sync_cursor_dir(&self) -> Result<(), BoardError> {
+        let d = self.root().join("cursors");
+        match std::fs::symlink_metadata(&d) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            _ => fsync_dir(&d),
+        }
     }
 
     fn with_retry<T>(&self, mut f: impl FnMut() -> Result<T, BoardError>) -> Result<T, BoardError> {
