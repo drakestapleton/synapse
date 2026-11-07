@@ -112,6 +112,7 @@ fn pause(point: &str) {
         return;
     }
     let _ = fs::write(dir.join("ready"), b"");
+    // Test-only barrier: a failed lookup of `go` just keeps waiting (bounded), nothing else.
     for _ in 0..6000 {
         if fs::symlink_metadata(dir.join("go")).is_ok() {
             return;
@@ -249,11 +250,14 @@ pub(crate) fn open_rw(root: &Path, path: &Path) -> Result<(File, bool), BoardErr
 /// so both files stay as they are and every retry refuses the same way. Compaction replaces
 /// the journal by `rename(2)`, so no legitimate state lacks it while the table names events.
 /// An empty journal under such a table is refused by the tail scan (`Committed`).
+///
+/// Both lookups are strict (only `NotFound` is absence): a journal or table that cannot be
+/// looked up is an error here, never "present" or "empty", so a transient lookup failure
+/// cannot let `open_rw` create an empty journal under a table that names committed events.
 fn refuse_lost_journal(jp: &Path, ip: &Path) -> Result<(), BoardError> {
-    match crate::record::lstat(jp) {
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        // Present, or not inspectable: `open_rw` vets and reports it.
-        _ => return Ok(()),
+    if present(jp)? {
+        // Present: `open_rw` vets it.
+        return Ok(());
     }
     match crate::record::lstat(ip) {
         Ok(m) if m.file_type().is_file() && m.len() > 0 => Err(corrupt(
@@ -264,7 +268,10 @@ fn refuse_lost_journal(jp: &Path, ip: &Path) -> Result<(), BoardError> {
                 m.len()
             ),
         )),
-        _ => Ok(()),
+        // An empty table names nothing; anything but a regular file is refused by `open_rw`.
+        Ok(_) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(io_err(ip)(e)),
     }
 }
 
@@ -423,6 +430,9 @@ fn mark_root_unsynced(root: &Path) -> Result<(), BoardError> {
 
 /// Create the empty marker file `p` unless something already has that name (never
 /// following a link). Markers need no durability of their own (see `DIRSYNC_PENDING`).
+///
+/// A lookup that fails is not read as "already set" or "absent" with any effect: it only
+/// means the no-follow create below is attempted, and that create's failure is returned.
 pub(crate) fn create_marker(p: &Path) -> Result<(), BoardError> {
     if fs::symlink_metadata(p).is_ok() {
         return Ok(());
@@ -982,6 +992,28 @@ fn rewrite_ids(p: &Path, ids: &[u64]) -> Result<(), BoardError> {
     fs::rename(&tmp, p).map_err(io_err(p))
 }
 
+/// The `.idx` files of `<root>/<d>` (`topics` or `inbox`), sorted. The listing decides which
+/// derived files a reboot rebuild, a torn-tail cleanup or a trim reaches, so it is complete
+/// or an error: only an absent directory is empty; a directory or an entry that cannot be
+/// read is [`BoardError::Io`], never a shorter list.
+fn index_files(root: &Path, d: &str) -> Result<Vec<PathBuf>, BoardError> {
+    let dir = root.join(d);
+    let rd = match crate::record::list_dir(&dir) {
+        Ok(rd) => rd,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(io_err(&dir)(e)),
+    };
+    let mut out = Vec::new();
+    for ent in rd {
+        let p = ent.map_err(io_err(&dir))?.path();
+        if p.extension().and_then(|x| x.to_str()) == Some("idx") {
+            out.push(p);
+        }
+    }
+    out.sort();
+    Ok(out)
+}
+
 /// `fdatasync` a group of files, in parallel threads (one journal commit can cover them).
 fn sync_group(files: &[(&Path, &File)]) -> Result<(), BoardError> {
     if files.len() <= 1 {
@@ -1120,6 +1152,8 @@ impl<'a> Writer<'a> {
         // sync failed earlier is retried, whoever created it), or a file appeared after the
         // check (created by `open_rw` below), and reconciled while an earlier change left
         // `dirsync.pending`. A failure refuses the open: nothing is acknowledged.
+        // A lookup error only takes the conservative path (publish under `RootLock`, root
+        // synced); `open_rw` then vets each file and returns its own lookup's error.
         let creating = fs::symlink_metadata(&jp).is_err() || fs::symlink_metadata(&ip).is_err();
         let open = || -> Result<_, BoardError> { Ok((open_rw(root, &jp)?, open_rw(root, &ip)?)) };
         let ((j, jc), (idx, ic)) = if creating {
@@ -1402,6 +1436,9 @@ impl<'a> Writer<'a> {
                         ),
                     ));
                 }
+                // Indexes first (see `clean_index_tails`): a failure keeps the torn tail, so
+                // the retry finds it and cleans again before any id is reused.
+                self.clean_index_tails()?;
                 self.j.set_len(pos).map_err(io_err(&self.jp))?;
                 self.j.sync_data().map_err(io_err(&self.jp))?;
                 self.rec.torn_tail_at = Some(pos);
@@ -1445,9 +1482,6 @@ impl<'a> Writer<'a> {
             if !self.rec.table_rebuilt {
                 self.rec.dropped_table_entry = true;
             }
-        }
-        if self.rec.torn_tail_at.is_some() {
-            self.clean_index_tails()?;
         }
         if self.rec.table_rebuilt {
             self.commit_all()?;
@@ -1534,15 +1568,12 @@ impl<'a> Writer<'a> {
         self.scan_tail(jlen, None)?;
         self.j.sync_data().map_err(io_err(&self.jp))?;
         let mut want: std::collections::BTreeMap<PathBuf, Vec<u64>> = Default::default();
+        // Every existing index is rewritten (one that no event names becomes empty), so the
+        // listing must be complete: a listing error refuses the rebuild with `boot` still
+        // the old one, and the next operation of this boot rebuilds again.
         for d in ["topics", "inbox"] {
-            let Ok(rd) = crate::record::list_dir(&root.join(d)) else {
-                continue;
-            };
-            for ent in rd.filter_map(|e| e.ok()) {
-                let p = ent.path();
-                if p.extension().and_then(|x| x.to_str()) == Some("idx") {
-                    want.entry(p).or_default();
-                }
+            for p in index_files(&root, d)? {
+                want.entry(p).or_default();
             }
         }
         for p in &self.pending {
@@ -1592,20 +1623,16 @@ impl<'a> Writer<'a> {
             .collect()
     }
 
-    /// After a torn tail was cut, drop index entries naming ids past the commit point (a
-    /// crash between the index group and the table entry can leave them).
+    /// Before a torn tail is cut, drop index entries naming ids past the commit point (a
+    /// crash between the index group and the table entry can leave them; the ids would be
+    /// handed out again, and a stale entry would deliver a later event to the wrong
+    /// reader). Every index must be reached, so a listing error is returned. This runs
+    /// before the cut, so a failure leaves the torn tail in place and the next writer
+    /// cleans again; the dropped ids are past the commit point, invisible to every reader.
     fn clean_index_tails(&self) -> Result<(), BoardError> {
         let root = self.board.root();
         for d in ["topics", "inbox"] {
-            let dir = root.join(d);
-            let Ok(rd) = crate::record::list_dir(&dir) else {
-                continue;
-            };
-            for ent in rd.filter_map(|e| e.ok()) {
-                let p = ent.path();
-                if p.extension().and_then(|x| x.to_str()) != Some("idx") {
-                    continue;
-                }
+            for p in index_files(root, d)? {
                 let (f, _) = open_rw(root, &p)?;
                 let mut len = f.metadata().map_err(io_err(&p))?.len();
                 len -= len % ID_BYTES;
@@ -1980,19 +2007,20 @@ impl Board {
     }
 
     /// Drop ids below `base` from every topic and inbox index (tmp + rename each; readers
-    /// skip ids below the base anyway, so either version is correct).
+    /// skip ids below the base anyway, so either version of one file is correct). An index
+    /// that cannot be reached is not skipped: the listing error is returned, so the
+    /// compaction (already published and durable at this point) does not report success
+    /// while an index may keep growing toward its read cap; a later compaction trims it.
     fn trim_indexes(&self, base: u64) -> Result<(), BoardError> {
         let root = self.root();
         for d in ["topics", "inbox"] {
             let dir = root.join(d);
-            let Ok(rd) = crate::record::list_dir(&dir) else {
+            let files = index_files(root, d)?;
+            if files.is_empty() {
+                // Absent or without indexes: nothing renamed, nothing to flush.
                 continue;
-            };
-            for ent in rd.filter_map(|e| e.ok()) {
-                let p = ent.path();
-                if p.extension().and_then(|x| x.to_str()) != Some("idx") {
-                    continue;
-                }
+            }
+            for p in files {
                 let (ids, _) =
                     read_ids_after(&p, base - 1, u64::MAX, usize::MAX, self.limits().max_events)?;
                 rewrite_ids(&p, &ids)?;
@@ -2101,9 +2129,26 @@ impl Board {
         for (d, expect) in [("topics", &expect_topic), ("inbox", &expect_inbox)] {
             let dir = self.root().join(d);
             let mut found: Vec<PathBuf> = Vec::new();
-            if let Ok(rd) = crate::record::list_dir(&dir) {
-                for ent in rd.filter_map(|e| e.ok()) {
-                    found.push(ent.path());
+            // A verification that cannot list a directory does not pass: the listing error
+            // (of the directory or of one entry) is a problem. Only an absent directory is
+            // empty; "missing" is reported only from a complete listing.
+            let mut complete = true;
+            match crate::record::list_dir(&dir) {
+                Ok(rd) => {
+                    for ent in rd {
+                        match ent {
+                            Ok(ent) => found.push(ent.path()),
+                            Err(e) => {
+                                complete = false;
+                                problems.push(format!("{}: cannot list: {e}", dir.display()));
+                            }
+                        }
+                    }
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    complete = false;
+                    problems.push(format!("{}: cannot list: {e}", dir.display()));
                 }
             }
             found.sort();
@@ -2129,7 +2174,7 @@ impl Board {
                 }
             }
             for (p, ids) in expect {
-                if !found.contains(p) {
+                if complete && !found.contains(p) {
                     problems.push(format!(
                         "{} is missing ({} ids expected)",
                         p.display(),

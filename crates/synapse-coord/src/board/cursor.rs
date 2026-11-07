@@ -561,6 +561,7 @@ impl Board {
         let d = self.root().join("cursors");
         match std::fs::symlink_metadata(&d) {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            // Present, or a lookup error: the sync itself must succeed (an error is returned).
             _ => fsync_dir(&d),
         }
     }

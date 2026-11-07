@@ -227,6 +227,14 @@ pub fn default_session(agent: &str) -> String {
 /// workspace answers from its snapshot.
 pub trait PathOracle: Send + Sync {
     fn exists(&self, rel: &str) -> bool;
+    /// [`PathOracle::exists`], with a lookup that could not be answered returned as an
+    /// error instead of read as "absent". Target-key resolution uses this: a transient
+    /// lookup failure must not key a file differently from a process that could see it
+    /// (two keys for one file would let two agents hold it). The default is
+    /// `Ok(self.exists(rel))`, for oracles that cannot fail (a snapshot, [`NoOracle`]).
+    fn lookup(&self, rel: &str) -> std::io::Result<bool> {
+        Ok(self.exists(rel))
+    }
     /// False for an oracle that cannot see the tree. Relative targets named from a
     /// subdirectory are then refused: crumb.c would resolve them by file existence, so a
     /// blind guess could key one file twice and let two agents hold it.
@@ -238,8 +246,29 @@ pub trait PathOracle: Send + Sync {
 /// Filesystem oracle (`lstat(top/rel)`), what crumb.c uses.
 pub struct FsOracle(pub PathBuf);
 impl PathOracle for FsOracle {
+    /// `lstat(top/rel) == 0`, crumb.c's `exists_at`: any error reads as absent here. Key
+    /// resolution uses [`PathOracle::lookup`], which does not.
     fn exists(&self, rel: &str) -> bool {
         record::lstat(&self.0.join(rel)).is_ok()
+    }
+    /// Absent only when the path cannot name a file for any process: `ENOENT`, `ENOTDIR`
+    /// (a component is not a directory), `ENAMETOOLONG`, `ELOOP` (a looping component).
+    /// Every other error (`EIO`, `EACCES`, ...) may hide a file another process sees, so
+    /// it is returned and the key is not guessed.
+    fn lookup(&self, rel: &str) -> std::io::Result<bool> {
+        match record::lstat(&self.0.join(rel)) {
+            Ok(_) => Ok(true),
+            Err(e)
+                if e.kind() == std::io::ErrorKind::NotFound
+                    || matches!(
+                        e.raw_os_error(),
+                        Some(libc::ENOTDIR | libc::ENAMETOOLONG | libc::ELOOP)
+                    ) =>
+            {
+                Ok(false)
+            }
+            Err(e) => Err(e),
+        }
     }
 }
 
@@ -377,11 +406,25 @@ impl Workspace {
         };
         let c1 = norm_path(&joined);
         let c2 = norm_path(target);
-        if let Some(c) = c1.as_deref().filter(|c| *c != "." && self.oracle.exists(c)) {
-            return Ok(c.to_string());
+        // A lookup that cannot be answered refuses the key instead of reading as absent.
+        let exists = |c: &str| -> Result<bool, CoordError> {
+            if c == "." {
+                return Ok(false);
+            }
+            self.oracle.lookup(c).map_err(|source| CoordError::Io {
+                path: Path::new(&self.top).join(c),
+                source,
+            })
+        };
+        if let Some(c) = c1.as_deref() {
+            if exists(c)? {
+                return Ok(c.to_string());
+            }
         }
-        if let Some(c) = c2.as_deref().filter(|c| *c != "." && self.oracle.exists(c)) {
-            return Ok(c.to_string());
+        if let Some(c) = c2.as_deref() {
+            if exists(c)? {
+                return Ok(c.to_string());
+            }
         }
         if target.contains('/') {
             if let Some(c) = c2.clone() {
@@ -819,24 +862,40 @@ fn fault_point(point: &str) {
 /// `stat`; not following also rules out a symlink loop). Every name ending in `.json` that
 /// is not a directory is returned, whatever its type; [`record::read_bounded`] then refuses
 /// a non-regular one without opening it, so a planted FIFO is reported, never read.
-fn collect_json(dir: &Path, out: &mut Vec<PathBuf>) {
-    let Ok(rd) = record::list_dir(dir) else {
-        return;
+///
+/// Complete or an error: callers decide from the list that no other record holds a lock
+/// (`close` drops an agent's presence when it holds no other lock; `sniff` reports the
+/// live locks), so only an absent directory (a new store has no `dirs/` yet, or a
+/// subdirectory removed since it was listed) is empty, and an entry that vanished between
+/// the listing and its type lookup is skipped. Every other listing, entry or type error is
+/// returned, never a shorter list.
+fn collect_json(dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), CoordError> {
+    let rd = match record::list_dir(dir) {
+        Ok(rd) => rd,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(io_err(dir)(e)),
     };
-    let mut ents: Vec<_> = rd
-        .filter_map(|e| e.ok())
-        .map(|e| (e.path(), e.file_type().ok()))
-        .collect();
+    let mut ents = Vec::new();
+    for e in rd {
+        let e = e.map_err(io_err(dir))?;
+        let full = e.path();
+        match e.file_type() {
+            Ok(ft) => ents.push((full, ft.is_dir())),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => return Err(io_err(&full)(err)),
+        }
+    }
     ents.sort_by(|a, b| a.0.cmp(&b.0));
-    for (full, ft) in ents {
-        if ft.is_some_and(|t| t.is_dir()) {
-            collect_json(&full, out);
+    for (full, is_dir) in ents {
+        if is_dir {
+            collect_json(&full, out)?;
         } else if let Some(n) = full.file_name().and_then(|n| n.to_str()) {
             if n.len() > 5 && n.ends_with(".json") {
                 out.push(full);
             }
         }
     }
+    Ok(())
 }
 
 impl Txn<'_> {
@@ -901,7 +960,7 @@ impl Txn<'_> {
     fn prune(&mut self) -> Result<(), CoordError> {
         let dd = self.store.root.join("dirs");
         let mut f = Vec::new();
-        collect_json(&dd, &mut f);
+        collect_json(&dd, &mut f)?;
         for p in f {
             let rel = p
                 .strip_prefix(&dd)
@@ -913,7 +972,7 @@ impl Txn<'_> {
             self.load(&p, false, Some(label))?;
         }
         let mut g = Vec::new();
-        collect_json(&self.store.root.join("agents"), &mut g);
+        collect_json(&self.store.root.join("agents"), &mut g)?;
         for p in g {
             self.load(&p, true, None)?;
         }
@@ -925,6 +984,8 @@ impl Txn<'_> {
     fn commit(mut self) -> Result<(), CoordError> {
         for r in &self.recs {
             if r.dead {
+                // Best effort, as in crumb.c: presence is advisory and no lock lives in an
+                // agent record, so one left behind only shows the agent until its TTL ends.
                 if fs::remove_file(&r.path).is_ok() {
                     fsync_dir(r.path.parent().unwrap_or(Path::new(".")))?;
                 }

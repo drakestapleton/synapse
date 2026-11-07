@@ -112,13 +112,19 @@ impl Board {
     }
 
     /// Every binding on the board (bounded; a hostile file under `agents/` is refused).
+    /// Complete or an error: `register` decides from it that a session holds no other live
+    /// tag, and `whoami` that a session holds none, so only an absent `agents/` is empty;
+    /// a directory or an entry that cannot be read is [`BoardError::Io`].
     pub(crate) fn bindings(&self) -> Result<Vec<Binding>, BoardError> {
         let dir = self.root().join("agents");
-        let Ok(rd) = crate::record::list_dir(&dir) else {
-            return Ok(Vec::new());
+        let rd = match crate::record::list_dir(&dir) {
+            Ok(rd) => rd,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) => return Err(super::io_err(&dir)(e)),
         };
         let mut tags = Vec::new();
-        for ent in rd.filter_map(|e| e.ok()) {
+        for ent in rd {
+            let ent = ent.map_err(super::io_err(&dir))?;
             let name = ent.file_name();
             let Some(n) = name.to_str() else { continue };
             let Some(tag) = n.strip_suffix(".json") else {

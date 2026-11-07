@@ -168,6 +168,8 @@ fn datagram_id(b: &[u8]) -> u64 {
 
 impl Drop for Watcher {
     fn drop(&mut self) {
+        // Best-effort cleanup of a non-durable socket: a failed lookup leaves the file, and
+        // the next `bind` finds it stale (connect refused) and removes it.
         if let Ok(m) = fs::symlink_metadata(&self.path) {
             if (m.dev(), m.ino()) == self.ino {
                 let _ = fs::remove_file(&self.path);
@@ -178,6 +180,12 @@ impl Drop for Watcher {
 
 /// Send `id` to every wake socket under `root/wake` (best effort, non-blocking). Returns the
 /// number of datagrams accepted by the kernel.
+///
+/// Every failure here (an unlistable `wake/`, an unreadable entry, a socket lookup or send
+/// that fails) only skips a wake, deliberately: wakes are advisory and sent after the ACK,
+/// nothing durable or acknowledged depends on them, and a watcher that misses one still
+/// finds the event on its next read (`Board::wait` reads before it blocks, and a wait
+/// ends at its timeout).
 pub(crate) fn wake_all(root: &Path, id: u64) -> usize {
     let Ok(rd) = fs::read_dir(root.join("wake")) else {
         return 0;
