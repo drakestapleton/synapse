@@ -195,4 +195,13 @@ cursors with at-least-once delivery, and best-effort wake datagrams so a waiting
 not poll. It lives under its own root with its own `BOARD_ID` and changes nothing in the
 coordination store's records or verbs. Board content is untrusted data. Design, crash rules
 and CLI: [`docs/SWARM_BOARD.md`](../../docs/SWARM_BOARD.md). Tests:
-`tests/board_core.rs`, `tests/board_cli.rs`.
+`tests/board_core.rs`, `tests/board_cli.rs`, `tests/durability.rs`.
+
+## Migration
+
+This crate is existing Rust. Under the pure-Omega directive (rule 3) it receives only
+minimal fixes of production defects, such as the board durability repairs of crumb924
+(aien-sovereign-core-mv#928 review rounds), and no new features, verbs or dependencies.
+Its successor is an Omega (`.om`) board for the swarm-bridge port: `om/swarm-bridge` in
+aien-sovereign-core-mv (crumb924), tracked in Linear DRA-460 (follow-up of DRA-97). The board's recovery contract and the
+regressions in `tests/durability.rs` are the behaviour that successor must reproduce.

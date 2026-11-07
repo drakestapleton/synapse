@@ -32,7 +32,8 @@
 //! journal that ends on a frame boundary before such a frame: that is damage to an
 //! acknowledged event, refused however short it is. A table this journal cannot place
 //! (another generation) still proves its last committed id, which every generation a
-//! compaction can leave holds: an empty or missing journal, or one whose frames end short
+//! compaction can leave holds: its last decodable entry's id plus one per partly written or
+//! undecodable slot after it. An empty or missing journal, or one whose frames end short
 //! of that id, is refused too, never rebuilt into an empty table that would reuse the ids.
 //! A reboot rebuild carries the same evidence (a partly written final entry counts) into
 //! its scan from offset 0. Recovery changes `journal.idx` only after the tail scan
@@ -1127,7 +1128,8 @@ enum Committed {
     /// The table names committed frames this journal cannot place (another generation, an
     /// unreadable first entry): nothing may be cut, and how far they reach in bytes is
     /// unknown, so a journal that ends on a frame boundary is accepted only when its frames
-    /// reach event `through` (the table's last decodable entry; 0 when none decodes), and
+    /// reach event `through` (the table's last decodable entry plus one per partly written
+    /// or undecodable slot after it, at least the slot count; see `Writer::unplaced`), and
     /// never with no frame at all. Every generation a compaction leaves (a cut between its
     /// renames, or a power loss before its root sync) holds that event: it keeps everything
     /// up to the last committed id, and `keep_since <= last`. Distinct from a known floor.
@@ -1288,9 +1290,7 @@ impl<'a> Writer<'a> {
                     // the last of them (see `Committed::Unplaced`), and the table is only
                     // replaced once the whole journal verified.
                     self.rec.table_rebuilt = true;
-                    self.committed = Committed::Unplaced {
-                        through: self.last_decodable_id(n)?,
-                    };
+                    self.committed = self.unplaced(n, slots)?;
                     return self.scan_tail(jlen, Some(0));
                 }
             }
@@ -1347,20 +1347,40 @@ impl<'a> Writer<'a> {
                     more: slots - k,
                 }
             }
-            _ => Committed::Unplaced { through: le.id },
+            _ => self.unplaced(k, slots)?,
         })
     }
 
-    /// The id of the last entry among the first `k` table slots that decodes (0 when none
-    /// does).
-    fn last_decodable_id(&self, mut k: u64) -> Result<u64, BoardError> {
+    /// `Committed::Unplaced` for a table of `slots` slots this journal cannot place, whose
+    /// first `full` slots are whole: the lowest id its last committed event can have. Slots
+    /// hold consecutive ids, and every slot after the last decodable entry (partly written
+    /// or not decoding) is the commit of one more frame, exactly as `Committed::Through`
+    /// counts them, so the bound is that entry's id plus the number of slots after it. Ids
+    /// start at 1, so it is never below `slots` (the whole bound when no entry decodes).
+    /// This is an id, not a frame count: a valid compaction keeps the ids but removes a
+    /// prefix of the frames. A bound past the id range cannot be established: refused.
+    fn unplaced(&self, full: u64, slots: u64) -> Result<Committed, BoardError> {
+        let mut k = full;
         while k > 0 {
             if let Some(e) = self.table_entry(k - 1)? {
-                return Ok(e.id);
+                let Some(through) = e.id.checked_add(slots - k) else {
+                    return Err(corrupt(
+                        &self.ip,
+                        (k - 1) * ENTRY_BYTES,
+                        format!(
+                            "entry for id {} with {} slots after it names an id past the id range; refusing",
+                            e.id,
+                            slots - k
+                        ),
+                    ));
+                };
+                return Ok(Committed::Unplaced {
+                    through: through.max(slots),
+                });
             }
             k -= 1;
         }
-        Ok(0)
+        Ok(Committed::Unplaced { through: slots })
     }
 
     /// Reconcile bytes after the commit point (see the torn-tail rule above). With

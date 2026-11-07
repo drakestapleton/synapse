@@ -52,6 +52,12 @@
 //!   unlistable coordination `dirs/` keeps an agent's presence and locks; an unanswerable
 //!   target lookup refuses the key instead of keying the file differently.
 //!
+//! Round 17 review finding B1: a generation-mismatch rebuild (a compaction cut between its
+//! renames) keeps the old table's terminal slot evidence. A partly written or undecodable
+//! final slot after its last decodable entry still proves one more committed id, so a
+//! journal ending at the last decodable id is refused (twice, files unchanged, no post, no
+//! id reused), same boot and after a reboot; the reviewer's six controls are kept.
+//!
 //! Permission-based cases make a directory unreadable (mode 0300: entries can still be
 //! created, renamed and opened by name, but the directory cannot be opened or listed). The
 //! superuser bypasses that, so those cases print `NOT_RUN` and return when run as uid 0.
@@ -1805,4 +1811,172 @@ fn r14_unanswerable_target_lookup_refuses_the_key() {
         "{}",
         show(&o)
     );
+}
+
+// ---------------------------------------------------------------------------------------
+// Round 17 B1: a generation-mismatch rebuild keeps the terminal slots of the old table.
+
+/// The reviewer's damaged fixtures (round 17 controls.py), all built from three posted
+/// events: ids 1, 2 and 3 acknowledged.
+#[derive(Clone, Copy, Debug)]
+enum R17 {
+    /// Cut compaction (new journal 2, 3), old table = two entries and one byte of the
+    /// third; the journal is intact. Control: recovers, the next post is id 4.
+    ValidPartial,
+    /// Cut compaction, intact old table, the journal loses its final frame (event 3).
+    /// Control: refused.
+    IntactTableLostFrame,
+    /// No compaction: same-generation table of two entries and one byte, the journal loses
+    /// frame 3. Control: refused.
+    SameGenerationPartialLost,
+    /// B1: cut compaction, old table = two entries and one byte of the third slot, the
+    /// journal loses its final frame. The partial slot is the only evidence of event 3.
+    PartialLost,
+    /// B1: cut compaction, three whole slots with the third one's checksum broken, the
+    /// journal loses its final frame.
+    UndecodableLost,
+}
+
+const R17_ONE: &str = "r17-boot-one";
+const R17_TWO: &str = "r17-boot-two";
+
+fn r17_post(root: &Path, text: &str, boot: &str) -> Output {
+    cli(
+        root,
+        Some("sa"),
+        &["post", "--thread", "t", "--topic", "lane/x", "--text", text],
+        &[("SYNAPSE_BOARD_BOOT_ID", boot)],
+    )
+}
+
+fn r17_fixture(v: R17, reboot: bool) -> Fx {
+    let f = scratch(&format!("r17-{v:?}-{reboot}"));
+    let boot = [("SYNAPSE_BOARD_BOOT_ID", R17_ONE)];
+    ok_cli(&cli(&f.root, None, &["init"], &boot));
+    ok_cli(&cli(&f.root, Some("sa"), &["register", "alpha"], &boot));
+    for i in 1..=3 {
+        let s = ok_cli(&r17_post(&f.root, &format!("event {i}"), R17_ONE));
+        assert_eq!(s.long_of("id", -1), i, "{v:?}: acknowledged id");
+    }
+    let ip = f.root.join("journal.idx");
+    let table = fs::read(&ip).unwrap();
+    assert_eq!(table.len(), 192, "{v:?}: three whole entries");
+    if !matches!(v, R17::SameGenerationPartialLost) {
+        compact_cut_between_renames(&f.root, 2, Some(R17_ONE));
+    }
+    if !matches!(v, R17::ValidPartial) {
+        // The journal ends exactly on the boundary before its final frame (event 3).
+        let j = fs::read(f.root.join("journal.log")).unwrap();
+        let last = frame_offsets(&j).len() - 1;
+        truncate_journal_before_frame(&f.root, last);
+    }
+    match v {
+        R17::ValidPartial | R17::SameGenerationPartialLost | R17::PartialLost => {
+            fs::write(&ip, &table[..129]).unwrap();
+        }
+        R17::UndecodableLost => {
+            let mut t = table.clone();
+            t[191] ^= 0x80;
+            fs::write(&ip, &t).unwrap();
+        }
+        R17::IntactTableLostFrame => {}
+    }
+    f
+}
+
+/// Two recoveries and a post, all refused as `Corrupt` (exit 2) with the journal, the
+/// table and the boot record byte for byte unchanged: no id is handed out again.
+fn r17_assert_refused(v: R17, reboot: bool) {
+    let f = r17_fixture(v, reboot);
+    let boot = if reboot { R17_TWO } else { R17_ONE };
+    let env = [("SYNAPSE_BOARD_BOOT_ID", boot)];
+    let before = files(&f.root);
+    for attempt in 1..=2 {
+        let o = cli(&f.root, None, &["recover"], &env);
+        assert_eq!(
+            o.status.code(),
+            Some(2),
+            "{v:?} reboot={reboot} attempt {attempt}: {}",
+            show(&o)
+        );
+        assert_eq!(
+            summary(&o).str_of("error").as_deref(),
+            Some("Corrupt"),
+            "{v:?} reboot={reboot} attempt {attempt}: {}",
+            show(&o)
+        );
+        assert_eq!(
+            files(&f.root),
+            before,
+            "{v:?} reboot={reboot} attempt {attempt}: journal, table and boot record unchanged"
+        );
+    }
+    let o = r17_post(&f.root, "would reuse id 3", boot);
+    assert_eq!(
+        o.status.code(),
+        Some(2),
+        "{v:?} reboot={reboot} post: {}",
+        show(&o)
+    );
+    assert_eq!(
+        summary(&o).str_of("error").as_deref(),
+        Some("Corrupt"),
+        "{v:?} reboot={reboot} post: {}",
+        show(&o)
+    );
+    assert_eq!(
+        files(&f.root),
+        before,
+        "{v:?} reboot={reboot}: the post wrote nothing"
+    );
+}
+
+#[test]
+fn r17_b1_same_boot_cut_compaction_partial_third_slot_with_its_frame_lost_is_refused() {
+    r17_assert_refused(R17::PartialLost, false);
+}
+
+#[test]
+fn r17_b1_boot_rebuild_cut_compaction_partial_third_slot_with_its_frame_lost_is_refused() {
+    r17_assert_refused(R17::PartialLost, true);
+}
+
+#[test]
+fn r17_b1_same_boot_cut_compaction_undecodable_third_slot_with_its_frame_lost_is_refused() {
+    r17_assert_refused(R17::UndecodableLost, false);
+}
+
+#[test]
+fn r17_b1_boot_rebuild_cut_compaction_undecodable_third_slot_with_its_frame_lost_is_refused() {
+    r17_assert_refused(R17::UndecodableLost, true);
+}
+
+#[test]
+fn r17_control_intact_table_or_same_generation_with_a_lost_frame_is_refused() {
+    for reboot in [false, true] {
+        r17_assert_refused(R17::IntactTableLostFrame, reboot);
+        r17_assert_refused(R17::SameGenerationPartialLost, reboot);
+    }
+}
+
+#[test]
+fn r17_control_cut_compaction_with_a_partial_slot_and_an_intact_journal_recovers() {
+    // Valid compaction removed a prefix: the new journal holds two frames under a table of
+    // three slots, and still reaches the last committed id 3.
+    for reboot in [false, true] {
+        let v = R17::ValidPartial;
+        let f = r17_fixture(v, reboot);
+        let boot = if reboot { R17_TWO } else { R17_ONE };
+        let env = [("SYNAPSE_BOARD_BOOT_ID", boot)];
+        let s = ok_cli(&cli(&f.root, None, &["recover"], &env));
+        assert_eq!(s.get("torn_tail_at"), Some(&J::Null), "nothing cut: {s:?}");
+        assert_eq!(
+            fs::metadata(f.root.join("journal.idx")).unwrap().len(),
+            128,
+            "reboot={reboot}: events 2 and 3 committed"
+        );
+        ok_cli(&cli(&f.root, None, &["check"], &env));
+        let p = ok_cli(&r17_post(&f.root, "event 4", boot));
+        assert_eq!(p.long_of("id", -1), 4, "reboot={reboot}: no id reused");
+    }
 }
