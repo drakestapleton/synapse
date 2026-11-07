@@ -8,7 +8,7 @@
 //! refused with [`BoardError::TagTaken`].
 
 use super::frame::{as_string, compact};
-use super::journal::{ensure_dir, fsync_dir, BoardLock};
+use super::journal::{ensure_dir, fsync_dir, reconcile_root, BoardLock};
 use super::{validate_session, validate_tag, Board, BoardError, PROTOCOL};
 use crate::json::{self, J};
 use std::fs;
@@ -167,6 +167,8 @@ impl Board {
         }
         let _lock = BoardLock::acquire(self.root())?;
         self.check_id_locked()?;
+        // Also flushes a root entry (`agents/` itself) an earlier attempt left unsynced: the
+        // binding below is not durable until its directory's root entry is.
         ensure_dir(self.root(), "agents")?;
         let now = self.now();
         let existing = self.read_binding(tag)?;
@@ -219,6 +221,7 @@ impl Board {
         let _lock = BoardLock::acquire(self.root())?;
         self.check_id_locked()?;
         self.check_binding(me)?;
+        reconcile_root(self.root())?;
         let p = self.binding_path(&me.tag);
         fs::remove_file(&p).map_err(super::io_err(&p))?;
         fsync_dir(&self.root().join("agents"))?;

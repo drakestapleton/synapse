@@ -209,8 +209,20 @@ pub(crate) fn open_rw(root: &Path, path: &Path) -> Result<(File, bool), BoardErr
     Ok((f, created))
 }
 
-/// Make `<root>/<name>` a real directory (a symlink or file planted there is refused).
+/// Make `<root>/<name>` a real directory (a symlink or file planted there is refused), then
+/// reconcile the root (`reconcile_root`): every durable mutator reaches its subdirectory
+/// through here, so an existing directory whose creation sync failed earlier (or any other
+/// root change left in `dirsync.pending`) is flushed before the caller reports success.
 pub(crate) fn ensure_dir(root: &Path, name: &str) -> Result<PathBuf, BoardError> {
+    let d = make_dir(root, name)?;
+    reconcile_root(root)?;
+    Ok(d)
+}
+
+/// `ensure_dir` without the reconciliation, for callers that reconcile the root
+/// themselves (`Writer::open`, after it created everything it needs) or keep nothing
+/// durable there (the wake sockets).
+pub(crate) fn make_dir(root: &Path, name: &str) -> Result<PathBuf, BoardError> {
     let d = root.join(name);
     match fs::symlink_metadata(&d) {
         Ok(m) if m.file_type().is_dir() => return Ok(d),
@@ -245,14 +257,27 @@ pub(crate) fn fsync_dir(d: &Path) -> Result<(), BoardError> {
 /// `<root>/dirsync.pending`: an entry of the board root (the journal, `journal.idx`, a
 /// subdirectory, `BOARD_ID`) was created or renamed but the directory sync that makes it
 /// durable has not succeeded yet. A later writer that sees it syncs the root again before
-/// it acknowledges anything (see `Writer::open`) and only then removes it. The marker is
-/// set before such a change where the code can (a subdirectory, `BOARD_ID`, compaction) and
-/// again after a failed sync; it needs no durability of its own, because what a reboot
-/// shows is already on disk, and a stale marker costs one extra directory sync.
+/// it acknowledges anything (see `Writer::open`), and so does every other durable mutator
+/// (`reconcile_root`: registration, cursors, subscriptions, init, unregister), including a
+/// retry that finds its subdirectory already there; only a successful sync removes it.
+/// The marker is set before such a change where the code can (a subdirectory, `BOARD_ID`,
+/// compaction) and again after a failed sync; it needs no durability of its own, because
+/// what a reboot shows is already on disk, and a stale marker costs one extra directory
+/// sync.
 pub(crate) const DIRSYNC_PENDING: &str = "dirsync.pending";
 
 fn root_sync_pending(root: &Path) -> bool {
     fs::symlink_metadata(root.join(DIRSYNC_PENDING)).is_ok()
+}
+
+/// Flush a root change an earlier operation left unsynced (`dirsync.pending`) before this
+/// one reports success; a failure is returned and the marker kept. A stat when nothing is
+/// pending.
+pub(crate) fn reconcile_root(root: &Path) -> Result<(), BoardError> {
+    if root_sync_pending(root) {
+        sync_root(root)?;
+    }
+    Ok(())
 }
 
 /// Set `dirsync.pending` (a no-op when anything already has that name).
@@ -919,7 +944,8 @@ impl<'a> Writer<'a> {
         let lock = BoardLock::acquire(root)?;
         board.check_id_locked()?;
         for d in SUBDIRS {
-            ensure_dir(root, d)?;
+            // Not `ensure_dir`: the root is reconciled below, once the files exist.
+            make_dir(root, d)?;
         }
         let jp = root.join(JOURNAL);
         let ip = root.join(TABLE);

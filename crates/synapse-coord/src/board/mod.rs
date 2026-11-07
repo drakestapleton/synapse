@@ -705,6 +705,9 @@ impl Board {
         let lock = journal::BoardLock::acquire(&root)?;
         let id = journal::ensure_board_id_locked(&root)?;
         journal::mark_boot_if_fresh(&root)?;
+        // An existing board: a root change an earlier init or writer could not sync (its
+        // `BOARD_ID`, a subdirectory) is flushed before this init reports success.
+        journal::reconcile_root(&root)?;
         drop(lock);
         Ok(Board {
             root,

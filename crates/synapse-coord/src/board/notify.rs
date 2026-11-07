@@ -9,7 +9,7 @@
 //! token; the reading agent still has to run to act on what it reads.
 
 use super::frame::key_hash;
-use super::journal::ensure_dir;
+use super::journal::make_dir;
 use super::{io_err, Board, BoardError, Resume};
 use crate::record::{refusal_for, RecordRefusal};
 use std::fs;
@@ -58,7 +58,8 @@ fn is_wake_name(n: &str) -> bool {
 
 impl Watcher {
     fn bind(board: &Board, tag: &str) -> Result<Watcher, BoardError> {
-        ensure_dir(board.root(), "wake")?;
+        // Wake sockets are not durable state: no root reconciliation for a watcher.
+        make_dir(board.root(), "wake")?;
         let path = wake_path(board.root(), tag);
         if path.as_os_str().len() > MAX_SUN_PATH {
             return Err(BoardError::SocketPathTooLong { path });
