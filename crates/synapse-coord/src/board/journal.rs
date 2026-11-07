@@ -26,8 +26,13 @@
 //! id (so a retry with the same idempotency key finds it). Anything else is the torn tail of
 //! a writer that died inside step 1 and is truncated, reported as
 //! [`Recovery::torn_tail_at`]. More than one frame's worth of unverifiable bytes is not a
-//! torn tail: it is refused as [`BoardError::Corrupt`], never guessed past. Readers never
-//! truncate; they stop at the commit point.
+//! torn tail: it is refused as [`BoardError::Corrupt`], never guessed past. Neither is an
+//! unverifiable frame that `journal.idx` names as committed (directly, through a partly
+//! written final entry, or because the table is being rebuilt): that is damage to an
+//! acknowledged event, refused however short it is. Recovery changes `journal.idx` only
+//! after the tail scan succeeded, so a refused recovery leaves both files byte for byte as
+//! they were and every retry refuses the same way. Readers never truncate; they stop at
+//! the commit point.
 //!
 //! **Directory syncs.** A new or renamed root entry (the journal, `journal.idx`, a
 //! subdirectory, `BOARD_ID`, the compacted generation) is durable only once the root
@@ -40,7 +45,8 @@
 //! writes to them in any order. `<root>/boot` records the kernel boot id of the last writer
 //! that verified them; the first writer (or reader, through [`Board::recover`]) of a new boot
 //! rebuilds all of them from the journal before anything else
-//! ([`Recovery::rebuilt_after_boot`]).
+//! ([`Recovery::rebuilt_after_boot`]). The old table is kept until the new one is written,
+//! and what it proves committed is never cut as a torn tail.
 
 use super::frame::{
     self, corrupt, key_hash, Entry, ENTRY_BYTES, FRAME_HEADER, H_IDEM, H_THREAD, H_TOPIC, ID_BYTES,
@@ -880,6 +886,10 @@ struct Writer<'a> {
     pending: Vec<Pending>,
     /// End of the last pending frame (`end` when there is none).
     tail_end: u64,
+    /// Recovery evidence: `journal.idx` names committed frames up to this journal offset
+    /// (u64::MAX: it names committed frames that cannot be placed). An unverifiable frame
+    /// starting before it is corruption of a committed event, never a torn tail to cut.
+    committed_floor: u64,
     rec: Recovery,
 }
 
@@ -916,6 +926,7 @@ impl<'a> Writer<'a> {
             end: 0,
             pending: Vec::new(),
             tail_end: 0,
+            committed_floor: 0,
             rec: Recovery::default(),
         };
         if needs_boot_rebuild(root)? {
@@ -972,21 +983,19 @@ impl<'a> Writer<'a> {
         })
     }
 
+    /// Same-boot reconciliation. Nothing in `journal.idx` is changed before the tail scan
+    /// has succeeded: a refusal leaves the table (and the journal) byte for byte as they
+    /// were, so the evidence that made this attempt refuse (the table's claim that events
+    /// are committed) is still there for the next one, which refuses the same way instead
+    /// of cutting acknowledged events as a torn tail.
     fn recover(&mut self) -> Result<(), BoardError> {
         let jlen = self.jlen()?;
-        let mut ilen = self.idx.metadata().map_err(io_err(&self.ip))?.len();
-        if ilen % ENTRY_BYTES != 0 {
-            ilen -= ilen % ENTRY_BYTES;
-            self.idx.set_len(ilen).map_err(io_err(&self.ip))?;
-            self.rec.dropped_table_entry = true;
-        }
+        let ilen = self.idx.metadata().map_err(io_err(&self.ip))?.len();
         let mut n = ilen / ENTRY_BYTES;
+        let mut drop_entry = ilen % ENTRY_BYTES != 0;
         if n > 0 && self.table_entry(n - 1)?.is_none() {
             n -= 1;
-            self.idx
-                .set_len(n * ENTRY_BYTES)
-                .map_err(io_err(&self.ip))?;
-            self.rec.dropped_table_entry = true;
+            drop_entry = true;
         }
         if n > 0 {
             let e0 = self.table_entry(0)?;
@@ -1017,17 +1026,57 @@ impl<'a> Writer<'a> {
                 _ => {
                     // The table belongs to another journal generation (a compaction cut
                     // between its two renames) or is unreadable: rebuild it from the
-                    // journal, which is the truth.
-                    self.idx.set_len(0).map_err(io_err(&self.ip))?;
+                    // journal, which is the truth. The old table claimed committed events,
+                    // so nothing may be cut while rebuilding, and it is only replaced once
+                    // the whole journal verified.
                     self.rec.table_rebuilt = true;
+                    self.committed_floor = u64::MAX;
+                    return self.scan_tail(jlen, Some(0));
                 }
             }
         }
-        self.scan_tail(jlen)
+        if drop_entry {
+            // A partly written final entry was the commit of the frame at `end`, which was
+            // durable before its entry was written: it must verify, never be cut.
+            self.committed_floor = self.end + 1;
+            return self.scan_tail(jlen, Some(n));
+        }
+        self.scan_tail(jlen, None)
     }
 
-    /// Reconcile bytes after the commit point (see the torn-tail rule above).
-    fn scan_tail(&mut self, jlen: u64) -> Result<(), BoardError> {
+    /// What the current `journal.idx` proves is committed, read without changing it: the
+    /// end of the frame its last decodable entry names when the table verifiably belongs to
+    /// this journal (its first entry is the frame at offset 0), `u64::MAX` when it holds
+    /// entries that cannot be placed, 0 when it holds none. Every entry names a frame that
+    /// was durable before the entry was written, so this survives a power loss.
+    fn table_floor(&self, jlen: u64) -> Result<u64, BoardError> {
+        let mut k = self.idx.metadata().map_err(io_err(&self.ip))?.len() / ENTRY_BYTES;
+        let le = loop {
+            if k == 0 {
+                return Ok(0);
+            }
+            if let Some(e) = self.table_entry(k - 1)? {
+                break e;
+            }
+            k -= 1;
+        };
+        Ok(match self.table_entry(0)? {
+            Some(e0)
+                if e0.offset == 0
+                    && e0.id > 0
+                    && le.id == e0.id + k - 1
+                    && self.frame_matches(&e0, jlen)? =>
+            {
+                le.frame_end()
+            }
+            _ => u64::MAX,
+        })
+    }
+
+    /// Reconcile bytes after the commit point (see the torn-tail rule above). With
+    /// `table_len`, `journal.idx` is cut to that many entries, but only after the scan
+    /// succeeded (a refusal changes nothing).
+    fn scan_tail(&mut self, jlen: u64, table_len: Option<u64>) -> Result<(), BoardError> {
         self.pending.clear();
         let mut pos = self.end;
         let mut expect = if self.last == 0 {
@@ -1078,6 +1127,16 @@ impl<'a> Writer<'a> {
                         format!("{reason} while rebuilding journal.idx; refusing"),
                     ));
                 }
+                if pos < self.committed_floor {
+                    // journal.idx names a committed frame here: damage, not a torn tail.
+                    return Err(corrupt(
+                        &self.jp,
+                        pos,
+                        format!(
+                            "{reason}, but journal.idx names a committed event at or after this offset; refusing"
+                        ),
+                    ));
+                }
                 self.j.set_len(pos).map_err(io_err(&self.jp))?;
                 self.j.sync_data().map_err(io_err(&self.jp))?;
                 self.rec.torn_tail_at = Some(pos);
@@ -1086,6 +1145,14 @@ impl<'a> Writer<'a> {
             }
         }
         self.tail_end = pos;
+        if let Some(k) = table_len {
+            self.idx
+                .set_len(k * ENTRY_BYTES)
+                .map_err(io_err(&self.ip))?;
+            if !self.rec.table_rebuilt {
+                self.rec.dropped_table_entry = true;
+            }
+        }
         if self.rec.torn_tail_at.is_some() {
             self.clean_index_tails()?;
         }
@@ -1165,11 +1232,13 @@ impl<'a> Writer<'a> {
     fn rebuild_after_boot(&mut self) -> Result<(), BoardError> {
         let root = self.board.root().to_path_buf();
         let jlen = self.jlen()?;
-        self.idx.set_len(0).map_err(io_err(&self.ip))?;
+        // The old table stays as it is until the new one is complete: what it proves is
+        // committed (a durable frame) is never cut as a torn tail, here or on a retry.
+        self.committed_floor = self.table_floor(jlen)?;
         self.base = 0;
         self.last = 0;
         self.end = 0;
-        self.scan_tail(jlen)?;
+        self.scan_tail(jlen, None)?;
         self.j.sync_data().map_err(io_err(&self.jp))?;
         let mut want: std::collections::BTreeMap<PathBuf, Vec<u64>> = Default::default();
         for d in ["topics", "inbox"] {
@@ -1200,6 +1269,9 @@ impl<'a> Writer<'a> {
             table.extend_from_slice(&p.e.encode());
         }
         self.idx.write_all_at(&table, 0).map_err(io_err(&self.ip))?;
+        self.idx
+            .set_len(table.len() as u64)
+            .map_err(io_err(&self.ip))?;
         self.idx.sync_data().map_err(io_err(&self.ip))?;
         if let (Some(f), Some(l)) = (self.pending.first(), self.pending.last()) {
             self.base = f.e.id;
