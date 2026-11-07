@@ -465,17 +465,32 @@ impl Board {
         Ok(c)
     }
 
+    /// Every cursor on the board. Compaction decides from this list whether it would drop
+    /// events a reader has not acknowledged, so the enumeration is complete or it fails:
+    /// only an absent `cursors/` directory means "no cursors"; a directory that cannot be
+    /// listed (permission, I/O) or an entry that cannot be read is an error, never an
+    /// empty or shortened list.
     pub(crate) fn all_cursors(&self) -> Result<Vec<(String, Cursor)>, BoardError> {
         let dir = self.root().join("cursors");
-        let Ok(rd) = std::fs::read_dir(&dir) else {
-            return Ok(Vec::new());
+        let rd = match std::fs::read_dir(&dir) {
+            Ok(rd) => rd,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) => return Err(super::io_err(&dir)(e)),
         };
-        let mut tags: Vec<String> = rd
-            .filter_map(|e| e.ok())
-            .filter_map(|e| e.file_name().to_str().map(str::to_string))
-            .filter_map(|n| n.strip_suffix(".json").map(str::to_string))
-            .filter(|t| validate_tag(t).is_ok())
-            .collect();
+        let mut tags: Vec<String> = Vec::new();
+        for ent in rd {
+            let ent = ent.map_err(super::io_err(&dir))?;
+            // Only `<valid tag>.json` is a cursor (`cursor_path`); temp files and foreign
+            // names are not cursors and are skipped.
+            if let Some(t) = ent
+                .file_name()
+                .to_str()
+                .and_then(|n| n.strip_suffix(".json"))
+                .filter(|t| validate_tag(t).is_ok())
+            {
+                tags.push(t.to_string());
+            }
+        }
         tags.sort();
         tags.into_iter()
             .map(|t| self.cursor(&t).map(|c| (t, c)))
