@@ -736,16 +736,35 @@ fn has_lock_by(root: &J, agent: &str) -> bool {
     }
 }
 
-/// Best-effort directory flush. Opened like every other store file: never following a final
-/// link, never blocking (a FIFO planted in place of a directory cannot stall the writer),
-/// and only if it really is a directory.
-fn fsync_dir(dir: &Path) {
-    if let Ok(f) = OpenOptions::new()
+/// Flush a directory, making the entries created, renamed or removed in it durable. A
+/// durability boundary: the caller must not report success (a receipt, an ACK, a written
+/// record) when this fails, because a power loss could then undo the entry.
+///
+/// Opened like every other store file: never following a final link, never blocking (a
+/// FIFO planted in place of a directory cannot stall the writer), and only if it really is
+/// a directory. Every open or sync error is returned, with one documented exception: an
+/// `fsync` answered with `EINVAL` means the file system does not support syncing a
+/// directory at all (Linux `fsync(2)`: "fd is bound to a special file ... which does not
+/// support synchronization"; PostgreSQL's `fsync_fname` tolerates the same case), so there
+/// is nothing more this process can do and it is treated as done.
+///
+/// Test-only fault injection through `SYNAPSE_COORD_FAULT`: `dir-sync-eio` makes the
+/// sync fail with `EIO`, `dir-sync-einval` with `EINVAL` (unset in normal use).
+fn fsync_dir(dir: &Path) -> Result<(), CoordError> {
+    let f = OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
         .open(dir)
-    {
-        let _ = f.sync_all();
+        .map_err(io_err(dir))?;
+    let r = match std::env::var("SYNAPSE_COORD_FAULT").as_deref() {
+        Ok("dir-sync-eio") => Err(std::io::Error::from_raw_os_error(libc::EIO)),
+        Ok("dir-sync-einval") => Err(std::io::Error::from_raw_os_error(libc::EINVAL)),
+        _ => f.sync_all(),
+    };
+    match r {
+        Ok(()) => Ok(()),
+        Err(e) if e.raw_os_error() == Some(libc::EINVAL) => Ok(()),
+        Err(e) => Err(io_err(dir)(e)),
     }
 }
 
@@ -778,8 +797,9 @@ fn durable_write(root: &Path, path: &Path, data: &[u8]) -> Result<(), CoordError
     }
     fault_point("before-rename");
     fs::rename(&tmp, path).map_err(io_err(path))?;
-    fsync_dir(dd);
-    Ok(())
+    // The rename is only durable once the directory is: no success before that. A retry
+    // renames again and so syncs again.
+    fsync_dir(dd)
 }
 
 /// Test-only fault injection: `SYNAPSE_COORD_FAULT=<point>` aborts the process at that point
@@ -901,7 +921,7 @@ impl Txn<'_> {
         for r in &self.recs {
             if r.dead {
                 if fs::remove_file(&r.path).is_ok() {
-                    fsync_dir(r.path.parent().unwrap_or(Path::new(".")));
+                    fsync_dir(r.path.parent().unwrap_or(Path::new(".")))?;
                 }
                 continue;
             }

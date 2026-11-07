@@ -136,7 +136,7 @@ pub(crate) fn ensure_marker_locked(root: &Path) -> Result<StoreId, CoordError> {
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
         Err(source) => return Err(CoordError::Io { path: p, source }),
     }
-    crate::fsync_dir(root);
+    crate::fsync_dir(root)?;
     read_marker(root)?.ok_or(CoordError::StoreIdMissing {
         root: root.to_path_buf(),
     })

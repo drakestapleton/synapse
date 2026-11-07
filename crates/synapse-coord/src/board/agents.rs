@@ -221,7 +221,7 @@ impl Board {
         self.check_binding(me)?;
         let p = self.binding_path(&me.tag);
         fs::remove_file(&p).map_err(super::io_err(&p))?;
-        fsync_dir(&self.root().join("agents"));
+        fsync_dir(&self.root().join("agents"))?;
         Ok(me.clone())
     }
 

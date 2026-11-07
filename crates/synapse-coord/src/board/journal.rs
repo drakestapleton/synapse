@@ -29,6 +29,12 @@
 //! torn tail: it is refused as [`BoardError::Corrupt`], never guessed past. Readers never
 //! truncate; they stop at the commit point.
 //!
+//! **Directory syncs.** A new or renamed root entry (the journal, `journal.idx`, a
+//! subdirectory, `BOARD_ID`, the compacted generation) is durable only once the root
+//! directory is synced; every such sync that fails fails the operation (no receipt, no
+//! ACK), and `dirsync.pending` (`DIRSYNC_PENDING`) makes the next writer sync the root
+//! again before it acknowledges anything.
+//!
 //! **After a reboot.** `journal.idx` and the id indexes are derived from the journal. A
 //! process crash keeps the page cache, so they stay exact; a power loss can lose unsynced
 //! writes to them in any order. `<root>/boot` records the kernel boot id of the last writer
@@ -209,8 +215,11 @@ pub(crate) fn ensure_dir(root: &Path, name: &str) -> Result<PathBuf, BoardError>
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(e) => return Err(io_err(&d)(e)),
     }
+    // A new subdirectory is a root entry: mark it before the change, so a failed sync is
+    // retried by the next writer (see `dirsync.pending`).
+    mark_root_unsynced(root)?;
     match fs::create_dir(&d) {
-        Ok(()) => crate::fsync_dir(root),
+        Ok(()) => sync_root(root)?,
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
         Err(e) => return Err(io_err(&d)(e)),
     }
@@ -220,8 +229,57 @@ pub(crate) fn ensure_dir(root: &Path, name: &str) -> Result<PathBuf, BoardError>
     }
 }
 
-pub(crate) fn fsync_dir(d: &Path) {
-    crate::fsync_dir(d)
+/// Flush a board directory (see `crate::fsync_dir`: every failure is an error).
+pub(crate) fn fsync_dir(d: &Path) -> Result<(), BoardError> {
+    Ok(crate::fsync_dir(d)?)
+}
+
+/// `<root>/dirsync.pending`: an entry of the board root (the journal, `journal.idx`, a
+/// subdirectory, `BOARD_ID`) was created or renamed but the directory sync that makes it
+/// durable has not succeeded yet. A later writer that sees it syncs the root again before
+/// it acknowledges anything (see `Writer::open`) and only then removes it. The marker is
+/// set before such a change where the code can (a subdirectory, `BOARD_ID`, compaction) and
+/// again after a failed sync; it needs no durability of its own, because what a reboot
+/// shows is already on disk, and a stale marker costs one extra directory sync.
+pub(crate) const DIRSYNC_PENDING: &str = "dirsync.pending";
+
+fn root_sync_pending(root: &Path) -> bool {
+    fs::symlink_metadata(root.join(DIRSYNC_PENDING)).is_ok()
+}
+
+/// Set `dirsync.pending` (a no-op when anything already has that name).
+fn mark_root_unsynced(root: &Path) -> Result<(), BoardError> {
+    let p = root.join(DIRSYNC_PENDING);
+    if fs::symlink_metadata(&p).is_ok() {
+        return Ok(());
+    }
+    OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o644)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
+        .open(&p)
+        .map(drop)
+        .map_err(io_err(&p))
+}
+
+/// Sync the board root. On success drop `dirsync.pending` (every change made before this
+/// sync is now durable; a change racing with it syncs again itself). On failure leave the
+/// marker (best effort: the sync error is what is returned) so the next writer retries the
+/// flush before it acknowledges.
+pub(crate) fn sync_root(root: &Path) -> Result<(), BoardError> {
+    match fsync_dir(root) {
+        Ok(()) => {
+            // Best effort: a leftover marker only costs the next writer one more sync.
+            let _ = fs::remove_file(root.join(DIRSYNC_PENDING));
+            Ok(())
+        }
+        Err(e) => {
+            let _ = mark_root_unsynced(root);
+            Err(e)
+        }
+    }
 }
 
 /// A process-wide mutex plus an `fcntl` write lock on one lock file, the pattern of the
@@ -322,6 +380,7 @@ pub(crate) fn ensure_board_id_locked(root: &Path) -> Result<BoardId, BoardError>
     let p = root.join(BOARD_ID_FILE);
     let tmp = root.join(format!("{BOARD_ID_FILE}.tmp{}", std::process::id()));
     let id = BoardId::random().map_err(io_err(Path::new("/dev/urandom")))?;
+    mark_root_unsynced(root)?;
     {
         let mut f = crate::record::create_temp(&tmp)?;
         f.write_all(&encode_board_id(&id)).map_err(io_err(&tmp))?;
@@ -334,7 +393,7 @@ pub(crate) fn ensure_board_id_locked(root: &Path) -> Result<BoardId, BoardError>
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
         Err(e) => return Err(io_err(&p)(e)),
     }
-    fsync_dir(root);
+    sync_root(root)?;
     read_board_id(root)?.ok_or(BoardError::BoardIdMissing {
         root: root.to_path_buf(),
     })
@@ -836,8 +895,14 @@ impl<'a> Writer<'a> {
         let ip = root.join(TABLE);
         let (j, jc) = open_rw(root, &jp)?;
         let (idx, ic) = open_rw(root, &ip)?;
-        if jc || ic {
-            fsync_dir(root);
+        // The journal's directory entry must be durable before any ACK. Sync the root when
+        // this open created a file, while the journal is still empty (so a creation whose
+        // sync failed earlier is retried, whoever created it), and while an earlier change
+        // left `dirsync.pending`. A failure refuses the open: nothing is acknowledged.
+        let pending = root_sync_pending(root);
+        let empty = j.metadata().map_err(io_err(&jp))?.len() == 0;
+        if jc || ic || empty || pending {
+            sync_root(root)?;
         }
         let mut w = Writer {
             board,
@@ -1073,8 +1138,11 @@ impl<'a> Writer<'a> {
         group.extend(t.files.iter().map(|(p, f)| (p.as_path(), f)));
         sync_group(&group)?;
         if t.created {
-            fsync_dir(&self.board.root().join("topics"));
-            fsync_dir(&self.board.root().join("inbox"));
+            // A new index file's entry is not needed for durability (the id indexes are
+            // rebuilt from the journal after a reboot), but a failed sync is still a
+            // failure: no ACK is given over an error.
+            fsync_dir(&self.board.root().join("topics"))?;
+            fsync_dir(&self.board.root().join("inbox"))?;
         }
         Ok(())
     }
@@ -1125,8 +1193,8 @@ impl<'a> Writer<'a> {
             open_rw(&root, p)?;
             rewrite_ids(p, ids)?;
         }
-        fsync_dir(&root.join("topics"));
-        fsync_dir(&root.join("inbox"));
+        fsync_dir(&root.join("topics"))?;
+        fsync_dir(&root.join("inbox"))?;
         let mut table = Vec::with_capacity(self.pending.len() * ENTRY_BYTES as usize);
         for p in &self.pending {
             table.extend_from_slice(&p.e.encode());
@@ -1507,10 +1575,14 @@ impl Board {
         } else {
             Vec::new()
         };
+        // The renames publish the new generation: mark the root before them and sync it
+        // after, so a failed sync refuses the compaction and the next writer flushes the
+        // root again before it acknowledges a post into the new journal.
+        mark_root_unsynced(root)?;
         fs::rename(&jt, &w.jp).map_err(io_err(&w.jp))?;
         fault("compact-between-renames");
         fs::rename(&it, &w.ip).map_err(io_err(&w.ip))?;
-        fsync_dir(root);
+        sync_root(root)?;
         self.trim_indexes(keep_since)?;
         Ok(CompactReport {
             base: keep_since,
@@ -1538,7 +1610,7 @@ impl Board {
                     read_ids_after(&p, base - 1, u64::MAX, usize::MAX, self.limits().max_events)?;
                 rewrite_ids(&p, &ids)?;
             }
-            fsync_dir(&dir);
+            fsync_dir(&dir)?;
         }
         Ok(())
     }
