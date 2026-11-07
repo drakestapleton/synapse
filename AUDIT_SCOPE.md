@@ -93,14 +93,13 @@ cargo clippy --locked --workspace --all-targets -- -D warnings
 cargo test --locked --workspace
 tests/gates/run.sh zero-disk-secrets
 tests/gates/run.sh workspace
-tests/gates/run.sh crumb-verify
 tests/gates/run.sh conformance
 ```
 
-- `crumb-verify` and `conformance` need a sibling `../aien-architecture`; `crumb-verify` builds
-  the crumb tool at `crumb.lock` `12ad0141b41ec67ef5aa51cb4e1815894c1083bb`, `conformance` checks out
-  `29780e56c9e6b9111d884e0d4b146737228c19f6`.
-- `.aien/always`: `CRUMB-VERIFY`, `SYNAPSE-ZERO-DISK-SECRETS`. Expected line from the secrets
+- `conformance` needs a sibling `../aien-architecture`; it checks out
+  `29780e56c9e6b9111d884e0d4b146737228c19f6`. The `crumb-verify` step and its CRUMB-VERIFY gate are
+  retired (DRA-97, 2026-11-07); `crumb.lock` still names `12ad0141b41ec67ef5aa51cb4e1815894c1083bb`.
+- `.aien/always`: `SYNAPSE-ZERO-DISK-SECRETS`. Expected line from the secrets
   gate: `Zero plaintext .env files verified.`
 - `scripts/run_gate4_qualification.sh` (comparative benchmark) needs a fixture repository and
   writes `evidence/gate4-qualification/`; `SMOKE=1` runs a small check.
