@@ -351,8 +351,22 @@ impl RootLock {
     }
 }
 
+/// Look up a durability marker (`dirsync.pending`, `cursors/<tag>.unsynced`). Test-only
+/// fault injection: `SYNAPSE_COORD_FAULT=marker-stat-eio:<file name>` makes the lookup of
+/// that one marker fail with `EIO` (unset in normal use).
+pub(crate) fn marker_stat(p: &Path) -> std::io::Result<()> {
+    if let Ok(v) = std::env::var("SYNAPSE_COORD_FAULT") {
+        if let (Some(want), Some(name)) = (v.strip_prefix("marker-stat-eio:"), p.file_name()) {
+            if name.to_str() == Some(want) {
+                return Err(std::io::Error::from_raw_os_error(libc::EIO));
+            }
+        }
+    }
+    fs::symlink_metadata(p).map(drop)
+}
+
 fn root_sync_pending(root: &Path) -> bool {
-    fs::symlink_metadata(root.join(DIRSYNC_PENDING)).is_ok()
+    marker_stat(&root.join(DIRSYNC_PENDING)).is_ok()
 }
 
 /// Flush a root change an earlier operation left unsynced (`dirsync.pending`) before this

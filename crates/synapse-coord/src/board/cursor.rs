@@ -222,7 +222,7 @@ impl Board {
     fn flush_unsynced_cursor(&self, tag: &str) -> Result<(), BoardError> {
         let m = self.unsynced_path(tag);
         crate::record::check_real_parents(self.root(), &m)?;
-        if std::fs::symlink_metadata(&m).is_err() {
+        if super::journal::marker_stat(&m).is_err() {
             return Ok(());
         }
         self.sync_cursor_dir()?;
