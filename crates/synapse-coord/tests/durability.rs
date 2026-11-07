@@ -10,6 +10,20 @@
 //!   that cannot sync directories) is the one tolerated answer.
 //! - B8: a cursor directory that cannot be listed refuses compaction; nothing is dropped.
 //!
+//! Round 11 review findings of the same pull request:
+//!
+//! - R4: a reboot rebuild refuses (twice, bytes unchanged) when `journal.idx` proves a
+//!   frame committed that the journal no longer verifies: a partly written final entry
+//!   over a corrupt frame, and a journal that ends on a frame boundary before a committed
+//!   frame (also the same-boot partial-entry case).
+//! - R5: an "already applied" retry (an ack at or below the cursor, a repeated
+//!   subscription, a compaction whose cursors were already expired) syncs its directory
+//!   again and fails while that sync still fails; compaction never publishes over cursor
+//!   state it could not flush.
+//! - R6: `dirsync.pending` is reconciled by every durable mutator, not only journal
+//!   writers: a registration or a first read retried while the root sync still fails is an
+//!   error; after the repair it succeeds and the marker is gone.
+//!
 //! Permission-based cases make a directory unreadable (mode 0300: entries can still be
 //! created, renamed and opened by name, but the directory cannot be opened or listed). The
 //! superuser bypasses that, so those cases print `NOT_RUN` and return when run as uid 0.
@@ -19,7 +33,7 @@ use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::sync::atomic::{AtomicU32, Ordering};
-use synapse_coord::board::{Board, BoardError, Kind, Post, Resume};
+use synapse_coord::board::{Board, BoardError, Kind, Post, Resume, Sub};
 use synapse_coord::json::{self, J};
 use synapse_coord::{ClaimOutcome, CoordError, CoordStore, Holder, Workspace};
 
@@ -35,6 +49,7 @@ impl Drop for Fx {
         for d in [
             self.root.clone(),
             self.root.join("cursors"),
+            self.root.join("subs"),
             self.root.join("store/crumb/v1/dirs"),
         ] {
             let _ = fs::set_permissions(&d, fs::Permissions::from_mode(0o755));
@@ -505,4 +520,270 @@ fn b8_unlistable_cursor_dir_refuses_compaction() {
         other => panic!("expected CompactRefused, got {other:?}"),
     }
     assert_eq!(bytes(&f.root), before);
+}
+
+// ---------------------------------------------------------------------------------------
+// R4: a reboot rebuild keeps every committed boundary journal.idx proves.
+
+/// `journal.idx` keeps its first two entries and ends in a partly written third one.
+fn partial_third_entry(root: &Path) {
+    let ip = root.join("journal.idx");
+    let mut t = fs::read(&ip).unwrap();
+    assert_eq!(t.len(), 192, "three whole entries");
+    t.truncate(128);
+    t.extend_from_slice(&[0xab; 20]);
+    fs::write(&ip, &t).unwrap();
+}
+
+fn truncate_journal_before_frame(root: &Path, n: usize) {
+    let jp = root.join("journal.log");
+    let mut j = fs::read(&jp).unwrap();
+    let off = frame_offsets(&j)[n];
+    j.truncate(off);
+    fs::write(&jp, &j).unwrap();
+}
+
+#[test]
+fn r4_boot_rebuild_refuses_a_partly_written_final_entry_over_a_corrupt_frame() {
+    // The reviewer's variant A: the old rebuild cut 236 bytes at offset 472 (event 3,
+    // whose partly written entry proves it was durable) and reported success.
+    let f = reboot_fixture("r4-partial");
+    partial_third_entry(&f.root);
+    let j = fs::read(f.root.join("journal.log")).unwrap();
+    corrupt_frame_at(&f.root, frame_offsets(&j)[2]);
+    assert_boot_rebuild_refuses_twice(&f);
+}
+
+#[test]
+fn r4_boot_rebuild_refuses_a_journal_that_ends_before_a_committed_frame() {
+    // The reviewer's variant B: an intact three-entry table, the journal cut exactly
+    // before the third frame. The old rebuild reached EOF on a frame boundary, never
+    // compared it with the table's floor, and replaced the table with two entries.
+    let f = reboot_fixture("r4-eof");
+    truncate_journal_before_frame(&f.root, 2);
+    assert_boot_rebuild_refuses_twice(&f);
+}
+
+#[test]
+fn r4_boot_rebuild_refuses_a_partly_written_entry_whose_frame_is_gone() {
+    // Both at once: the partly written third entry is the only evidence of event 3, and
+    // the journal ends on the boundary before it.
+    let f = reboot_fixture("r4-partial-eof");
+    partial_third_entry(&f.root);
+    truncate_journal_before_frame(&f.root, 2);
+    assert_boot_rebuild_refuses_twice(&f);
+}
+
+#[test]
+fn r4_same_boot_partly_written_entry_refuses_a_journal_that_ends_at_its_frame() {
+    let (f, b) = fx("r4-same-boot-eof");
+    b.register("sa", "alpha", None).unwrap();
+    for i in 1..=3 {
+        post(&b, "sa", &[], &format!("event {i}")).unwrap();
+    }
+    partial_third_entry(&f.root);
+    truncate_journal_before_frame(&f.root, 2);
+    let before = bytes(&f.root);
+    for attempt in 1..=2 {
+        let r = b.recover();
+        assert!(
+            is_corrupt(&r),
+            "attempt {attempt}: expected Corrupt, got {r:?}"
+        );
+        assert_eq!(bytes(&f.root), before, "attempt {attempt}: unchanged");
+    }
+}
+
+#[test]
+fn r4_boot_rebuild_adopts_a_partly_written_final_entry_whose_frame_verifies() {
+    // Control: the evidence only refuses what does not verify. The frame the partial
+    // entry names is intact, so the rebuild succeeds with all three events.
+    let f = reboot_fixture("r4-partial-ok");
+    partial_third_entry(&f.root);
+    let s = ok_cli(&board_cli(&f.root, None, &["recover"], "test-boot-two"));
+    assert_eq!(s.get("rebuilt_after_boot"), Some(&J::True), "{s:?}");
+    assert_eq!(s.get("torn_tail_at"), Some(&J::Null), "nothing cut: {s:?}");
+    assert_eq!(
+        fs::metadata(f.root.join("journal.idx")).unwrap().len(),
+        192,
+        "all three events committed again"
+    );
+    // `check` exits 0 only when journal.idx and every index agree with the journal.
+    ok_cli(&board_cli(&f.root, None, &["check"], "test-boot-two"));
+}
+
+// ---------------------------------------------------------------------------------------
+// R5: an already-applied retry is not durable until its directory is synced.
+
+#[test]
+fn r5_ack_retry_with_the_cursor_dir_sync_still_failing_is_not_an_ack() {
+    let (f, b) = fx("r5-ack");
+    if is_superuser("r5_ack_retry", &f.root) {
+        return;
+    }
+    b.register("sa", "alpha", None).unwrap();
+    b.register("sb", "beta", None).unwrap();
+    let id = post(&b, "sa", &["beta"], "message").unwrap();
+    assert_eq!(b.deliver("sb", 10, Resume::Acked).unwrap().events.len(), 1);
+    chmod(&f.root.join("cursors"), 0o300);
+    // The first ack renames the cursor into place, then fails its directory sync. The
+    // retry finds the cursor already at `id`: it must sync again, and that still fails.
+    let first = b.ack("sb", id);
+    let retry = b.ack("sb", id);
+    chmod(&f.root.join("cursors"), 0o755);
+    assert!(is_io(&first), "first: expected Io, got {first:?}");
+    assert!(
+        is_io(&retry),
+        "retry with the sync still failing: expected Io, got {retry:?}"
+    );
+    // Repaired: the same retry is now a durable success.
+    let c = b.ack("sb", id).unwrap();
+    assert_eq!((c.acked, c.delivered, c.exists), (id, id, true));
+}
+
+#[test]
+fn r5_subscribe_retry_with_the_subs_dir_sync_still_failing_is_an_error() {
+    let (f, b) = fx("r5-subs");
+    if is_superuser("r5_subscribe_retry", &f.root) {
+        return;
+    }
+    b.register("sa", "alpha", None).unwrap();
+    b.subscribe("sa", &Sub::Topic("lane/a".into())).unwrap();
+    chmod(&f.root.join("subs"), 0o300);
+    let sub = Sub::Topic("lane/b".into());
+    let first = b.subscribe("sa", &sub);
+    let retry = b.subscribe("sa", &sub);
+    chmod(&f.root.join("subs"), 0o755);
+    assert!(is_io(&first), "first: expected Io, got {first:?}");
+    assert!(is_io(&retry), "retry: expected Io, got {retry:?}");
+    let s = b.subscribe("sa", &sub).unwrap();
+    assert_eq!(s.topics, vec!["lane/a".to_string(), "lane/b".to_string()]);
+}
+
+/// `board compact --keep-since <keep> --expire-cursors`, optionally with an injected fault.
+fn compact_cli(root: &Path, keep: u64, fault: Option<&str>) -> Output {
+    let mut c = Command::new(BIN);
+    c.arg("board")
+        .arg("--board-root")
+        .arg(root)
+        .args([
+            "compact",
+            "--keep-since",
+            &keep.to_string(),
+            "--expire-cursors",
+        ])
+        .env_remove("SYNAPSE_COORD_FAULT")
+        .env_remove("SYNAPSE_BOARD_ID")
+        .env_remove("SYNAPSE_BOARD_SESSION")
+        .env_remove("CRUMB_SESSION")
+        .env_remove("SYNAPSE_BOARD_BOOT_ID")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    if let Some(p) = fault {
+        c.env("SYNAPSE_COORD_FAULT", p);
+    }
+    c.output().unwrap()
+}
+
+#[test]
+fn r5_compaction_retry_after_a_failed_expiration_sync_refuses_with_the_journal_unchanged() {
+    let (f, b) = fx("r5-compact");
+    b.register("sa", "alpha", None).unwrap();
+    b.register("sb", "beta", None).unwrap();
+    let first = post(&b, "sa", &["beta"], "e1").unwrap();
+    assert_eq!(b.deliver("sb", 1, Resume::Acked).unwrap().events.len(), 1);
+    b.ack("sb", first).unwrap();
+    for i in 2..=4 {
+        post(&b, "sa", &["beta"], &format!("e{i}")).unwrap();
+    }
+    // beta (acked 1) lags behind keep_since 3. Every directory sync fails (EIO): the first
+    // attempt writes `expired: true` and fails its sync; the retry finds beta already
+    // expired, so it writes no cursor, and must still not publish over that unsynced
+    // expiration.
+    let before = bytes(&f.root);
+    for attempt in 1..=2 {
+        let o = compact_cli(&f.root, 3, Some("dir-sync-eio"));
+        assert_eq!(
+            o.status.code(),
+            Some(1),
+            "attempt {attempt}: {} {}",
+            String::from_utf8_lossy(&o.stdout),
+            String::from_utf8_lossy(&o.stderr)
+        );
+        assert_eq!(
+            summary(&o).str_of("error").as_deref(),
+            Some("Io"),
+            "attempt {attempt}"
+        );
+        assert_eq!(
+            bytes(&f.root),
+            before,
+            "attempt {attempt}: journal.log and journal.idx must be unchanged"
+        );
+    }
+    // Control: with the fault gone, the compaction runs. beta's expiration was written by
+    // the first attempt (so this run expires nobody new) and is flushed before publishing.
+    let s = ok_cli(&compact_cli(&f.root, 3, None));
+    assert_eq!(s.get("expired"), Some(&J::Arr(vec![])), "{s:?}");
+    assert_eq!(b.bounds().unwrap(), (3, 4));
+    assert!(b.cursor("beta").unwrap().expired);
+}
+
+// ---------------------------------------------------------------------------------------
+// R6: every durable mutator reconciles a pending root sync.
+
+#[test]
+fn r6_register_retry_with_the_root_sync_still_failing_is_an_error() {
+    let (f, b) = fx("r6-register");
+    if is_superuser("r6_register_retry", &f.root) {
+        return;
+    }
+    let pending = f.root.join("dirsync.pending");
+    chmod(&f.root, 0o300);
+    // The first call creates agents/ and fails the root sync; the retry finds agents/
+    // there and must flush the root again (still failing) before writing a binding.
+    let first = b.register("sa", "alpha", None);
+    let retry = b.register("sa", "alpha", None);
+    let marked = fs::symlink_metadata(&pending).is_ok();
+    chmod(&f.root, 0o755);
+    assert!(is_io(&first), "first: expected Io, got {first:?}");
+    assert!(
+        is_io(&retry),
+        "retry with the root sync still failing: expected Io, got {retry:?}"
+    );
+    assert!(marked, "the retry marker is kept while the sync fails");
+    let r = b.register("sa", "alpha", None).unwrap();
+    assert_eq!(r.me.tag, "alpha");
+    assert!(
+        fs::symlink_metadata(&pending).is_err(),
+        "the successful root sync clears the marker"
+    );
+    assert_eq!(b.whoami("sa").unwrap().tag, "alpha");
+}
+
+#[test]
+fn r6_first_read_with_a_pending_root_sync_still_failing_is_an_error() {
+    let (f, b) = fx("r6-cursor");
+    if is_superuser("r6_first_read", &f.root) {
+        return;
+    }
+    b.register("sa", "alpha", None).unwrap();
+    b.register("sb", "beta", None).unwrap();
+    post(&b, "sa", &["beta"], "for beta").unwrap();
+    // An earlier root change whose sync failed (the marker is what that failure leaves).
+    let pending = f.root.join("dirsync.pending");
+    fs::write(&pending, b"").unwrap();
+    chmod(&f.root, 0o300);
+    // beta's first read creates its durable cursor under cursors/, which exists: the root
+    // must be flushed first, and that still fails.
+    let first = b.deliver("sb", 10, Resume::Acked);
+    let retry = b.deliver("sb", 10, Resume::Acked);
+    chmod(&f.root, 0o755);
+    assert!(is_io(&first), "first: expected Io, got {first:?}");
+    assert!(is_io(&retry), "retry: expected Io, got {retry:?}");
+    assert!(!b.cursor("beta").unwrap().exists, "no cursor was created");
+    assert_eq!(b.deliver("sb", 10, Resume::Acked).unwrap().events.len(), 1);
+    assert!(fs::symlink_metadata(&pending).is_err());
+    assert!(b.cursor("beta").unwrap().exists);
 }
