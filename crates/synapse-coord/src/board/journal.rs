@@ -90,6 +90,30 @@ pub(crate) fn fault_active(point: &str) -> bool {
     std::env::var("SYNAPSE_COORD_FAULT").as_deref() == Ok(point)
 }
 
+/// Test-only barrier (`SYNAPSE_COORD_FAULT=<point>` plus `SYNAPSE_COORD_PAUSE_DIR=<dir>`):
+/// the first time this process reaches `point` it creates `<dir>/ready` and waits (at most
+/// 60 s) until `<dir>/go` exists, so an interleaving test can run another process inside
+/// exactly this window. Unset in normal use.
+fn pause(point: &str) {
+    static PAUSED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if !fault_active(point) {
+        return;
+    }
+    let Some(dir) = std::env::var_os("SYNAPSE_COORD_PAUSE_DIR").map(PathBuf::from) else {
+        return;
+    };
+    if PAUSED.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        return;
+    }
+    let _ = fs::write(dir.join("ready"), b"");
+    for _ in 0..6000 {
+        if fs::symlink_metadata(dir.join("go")).is_ok() {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
 /// This kernel boot (`/proc/sys/kernel/random/boot_id`). `SYNAPSE_BOARD_BOOT_ID` overrides
 /// it so tests can simulate a reboot. None where neither is available: reboots are then not
 /// detected and the derived files are trusted as they are.
@@ -304,6 +328,7 @@ fn mark_root_unsynced(root: &Path) -> Result<(), BoardError> {
 pub(crate) fn sync_root(root: &Path) -> Result<(), BoardError> {
     match fsync_dir(root) {
         Ok(()) => {
+            pause("pause-after-root-sync");
             // Best effort: a leftover marker only costs the next writer one more sync.
             let _ = fs::remove_file(root.join(DIRSYNC_PENDING));
             Ok(())
@@ -1752,6 +1777,10 @@ impl Board {
         fs::rename(&jt, &w.jp).map_err(io_err(&w.jp))?;
         fault("compact-between-renames");
         fs::rename(&it, &w.ip).map_err(io_err(&w.ip))?;
+        if fault_active("compact-root-sync-eio") {
+            // Test-only: the publication's root sync fails; the marker set above stays.
+            return Err(io_err(root)(std::io::Error::from_raw_os_error(libc::EIO)));
+        }
         sync_root(root)?;
         self.trim_indexes(keep_since)?;
         Ok(CompactReport {
