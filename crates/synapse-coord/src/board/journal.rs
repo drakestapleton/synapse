@@ -28,11 +28,13 @@
 //! [`Recovery::torn_tail_at`]. More than one frame's worth of unverifiable bytes is not a
 //! torn tail: it is refused as [`BoardError::Corrupt`], never guessed past. Neither is an
 //! unverifiable frame that `journal.idx` names as committed (directly, through a partly
-//! written final entry, or because the table is being rebuilt): that is damage to an
-//! acknowledged event, refused however short it is. Recovery changes `journal.idx` only
-//! after the tail scan succeeded, so a refused recovery leaves both files byte for byte as
-//! they were and every retry refuses the same way. Readers never truncate; they stop at
-//! the commit point.
+//! written or undecodable final entry, or because the table is being rebuilt), nor a
+//! journal that ends on a frame boundary before such a frame: that is damage to an
+//! acknowledged event, refused however short it is. A reboot rebuild carries the same
+//! evidence (a partly written final entry counts) into its scan from offset 0. Recovery
+//! changes `journal.idx` only after the tail scan succeeded, so a refused recovery leaves
+//! both files byte for byte as they were and every retry refuses the same way. Readers
+//! never truncate; they stop at the commit point.
 //!
 //! **Directory syncs.** A new or renamed root entry (the journal, `journal.idx`, a
 //! subdirectory, `BOARD_ID`, the compacted generation) is durable only once the root
@@ -886,11 +888,29 @@ struct Writer<'a> {
     pending: Vec<Pending>,
     /// End of the last pending frame (`end` when there is none).
     tail_end: u64,
-    /// Recovery evidence: `journal.idx` names committed frames up to this journal offset
-    /// (u64::MAX: it names committed frames that cannot be placed). An unverifiable frame
-    /// starting before it is corruption of a committed event, never a torn tail to cut.
-    committed_floor: u64,
+    /// Recovery evidence: what `journal.idx` proved committed before recovery touched it.
+    /// The tail scan must verify every frame it names; one that does not verify, or a
+    /// journal that ends before it, is damage to a committed event, never a torn tail.
+    committed: Committed,
     rec: Recovery,
+}
+
+/// What `journal.idx` proves is committed beyond the point a tail scan starts from, read
+/// before recovery changes anything. Every table entry, even a partly written or
+/// undecodable final one, was written only after the frame it names was durable, so this
+/// evidence survives a power loss.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Committed {
+    /// Nothing: every frame after the scan start may be a pending frame or a torn tail.
+    Nothing,
+    /// Every frame starting before byte `floor` is committed, and so are the `more` frames
+    /// that follow it (named by final table entries that are partly written or do not
+    /// decode). The scan must reach `floor` and verify `more` frames from there.
+    Through { floor: u64, more: u64 },
+    /// The table names committed frames this journal cannot place (another generation, an
+    /// unreadable first entry): nothing may be cut, but how far they reach is unknown, so a
+    /// journal that ends on a frame boundary is accepted. Distinct from a known floor.
+    Unplaced,
 }
 
 impl<'a> Writer<'a> {
@@ -926,7 +946,7 @@ impl<'a> Writer<'a> {
             end: 0,
             pending: Vec::new(),
             tail_end: 0,
-            committed_floor: 0,
+            committed: Committed::Nothing,
             rec: Recovery::default(),
         };
         if needs_boot_rebuild(root)? {
@@ -991,6 +1011,7 @@ impl<'a> Writer<'a> {
     fn recover(&mut self) -> Result<(), BoardError> {
         let jlen = self.jlen()?;
         let ilen = self.idx.metadata().map_err(io_err(&self.ip))?.len();
+        let slots = ilen.div_ceil(ENTRY_BYTES);
         let mut n = ilen / ENTRY_BYTES;
         let mut drop_entry = ilen % ENTRY_BYTES != 0;
         if n > 0 && self.table_entry(n - 1)?.is_none() {
@@ -1030,30 +1051,45 @@ impl<'a> Writer<'a> {
                     // so nothing may be cut while rebuilding, and it is only replaced once
                     // the whole journal verified.
                     self.rec.table_rebuilt = true;
-                    self.committed_floor = u64::MAX;
+                    self.committed = Committed::Unplaced;
                     return self.scan_tail(jlen, Some(0));
                 }
             }
         }
         if drop_entry {
-            // A partly written final entry was the commit of the frame at `end`, which was
-            // durable before its entry was written: it must verify, never be cut.
-            self.committed_floor = self.end + 1;
+            // A partly written (or undecodable) final entry was the commit of the frame at
+            // `end`, which was durable before its entry was written: it must verify, never
+            // be cut, and a journal that ends at `end` lost it.
+            self.committed = Committed::Through {
+                floor: self.end,
+                more: slots - n,
+            };
             return self.scan_tail(jlen, Some(n));
         }
         self.scan_tail(jlen, None)
     }
 
-    /// What the current `journal.idx` proves is committed, read without changing it: the
-    /// end of the frame its last decodable entry names when the table verifiably belongs to
-    /// this journal (its first entry is the frame at offset 0), `u64::MAX` when it holds
-    /// entries that cannot be placed, 0 when it holds none. Every entry names a frame that
-    /// was durable before the entry was written, so this survives a power loss.
-    fn table_floor(&self, jlen: u64) -> Result<u64, BoardError> {
-        let mut k = self.idx.metadata().map_err(io_err(&self.ip))?.len() / ENTRY_BYTES;
+    /// What the current `journal.idx` proves is committed, read without changing it (the
+    /// reboot scan starts at offset 0). When the table verifiably belongs to this journal
+    /// (its first entry is the frame at offset 0): every frame up to the end of the one its
+    /// last decodable entry names, plus one more frame per final slot after it that is
+    /// partly written or does not decode, exactly like the same-boot `drop_entry` case.
+    /// A table with only such slots proves that many frames from offset 0. `Unplaced` when
+    /// it holds decodable entries this journal cannot place, `Nothing` when it is empty.
+    fn table_evidence(&self, jlen: u64) -> Result<Committed, BoardError> {
+        let ilen = self.idx.metadata().map_err(io_err(&self.ip))?.len();
+        let slots = ilen.div_ceil(ENTRY_BYTES);
+        let mut k = ilen / ENTRY_BYTES;
         let le = loop {
             if k == 0 {
-                return Ok(0);
+                return Ok(if slots == 0 {
+                    Committed::Nothing
+                } else {
+                    Committed::Through {
+                        floor: 0,
+                        more: slots,
+                    }
+                });
             }
             if let Some(e) = self.table_entry(k - 1)? {
                 break e;
@@ -1067,9 +1103,12 @@ impl<'a> Writer<'a> {
                     && le.id == e0.id + k - 1
                     && self.frame_matches(&e0, jlen)? =>
             {
-                le.frame_end()
+                Committed::Through {
+                    floor: le.frame_end(),
+                    more: slots - k,
+                }
             }
-            _ => u64::MAX,
+            _ => Committed::Unplaced,
         })
     }
 
@@ -1084,6 +1123,12 @@ impl<'a> Writer<'a> {
         } else {
             Some(self.last + 1)
         };
+        // Frames verified at or after the evidence floor (see `Committed::Through`).
+        let (floor, more) = match self.committed {
+            Committed::Through { floor, more } => (floor, more),
+            Committed::Nothing | Committed::Unplaced => (0, 0),
+        };
+        let mut beyond = 0u64;
         while pos < jlen {
             let bad = match read_frame(&self.j, &self.jp, pos, jlen)? {
                 Ok((len, crc, body)) => match Event::from_body(&body) {
@@ -1096,6 +1141,9 @@ impl<'a> Writer<'a> {
                         }
                         let e = entry_for(&ev, pos, len, crc);
                         expect = Some(ev.id + 1);
+                        if pos >= floor {
+                            beyond += 1;
+                        }
                         pos = e.frame_end();
                         self.pending.push(Pending {
                             e,
@@ -1118,16 +1166,16 @@ impl<'a> Writer<'a> {
                         format!("{reason}, with {torn} bytes after it (more than one frame): not a torn tail; refusing"),
                     ));
                 }
-                if self.rec.table_rebuilt {
-                    // The old table claimed committed events; never cut anything while
-                    // rebuilding it.
+                if self.rec.table_rebuilt || self.committed == Committed::Unplaced {
+                    // The old table claimed committed events it cannot place; never cut
+                    // anything while rebuilding it.
                     return Err(corrupt(
                         &self.jp,
                         pos,
                         format!("{reason} while rebuilding journal.idx; refusing"),
                     ));
                 }
-                if pos < self.committed_floor {
+                if pos < floor || beyond < more {
                     // journal.idx names a committed frame here: damage, not a torn tail.
                     return Err(corrupt(
                         &self.jp,
@@ -1143,6 +1191,18 @@ impl<'a> Writer<'a> {
                 self.rec.torn_bytes = torn;
                 break;
             }
+        }
+        if pos < floor || beyond < more {
+            // The journal ends on a frame boundary before a frame journal.idx names as
+            // committed (it was durable before its entry was written): the event is lost.
+            // Refused before anything is changed, so a retry refuses the same way.
+            return Err(corrupt(
+                &self.jp,
+                pos,
+                format!(
+                    "journal ends at {pos}, before the committed events journal.idx names (through offset {floor}, {more} more); refusing"
+                ),
+            ));
         }
         self.tail_end = pos;
         if let Some(k) = table_len {
@@ -1234,7 +1294,7 @@ impl<'a> Writer<'a> {
         let jlen = self.jlen()?;
         // The old table stays as it is until the new one is complete: what it proves is
         // committed (a durable frame) is never cut as a torn tail, here or on a retry.
-        self.committed_floor = self.table_floor(jlen)?;
+        self.committed = self.table_evidence(jlen)?;
         self.base = 0;
         self.last = 0;
         self.end = 0;
