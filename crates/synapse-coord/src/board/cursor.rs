@@ -218,11 +218,12 @@ impl Board {
     }
 
     /// Discharge a cursor publication an earlier write left unsynced (caller holds the tag
-    /// lock): flush `cursors/` and drop the marker. A failure is returned, the marker kept.
+    /// lock): flush `cursors/` and drop the marker. A failure (of the flush or of the marker
+    /// lookup itself; only `NotFound` means nothing is owed) is returned, the marker kept.
     fn flush_unsynced_cursor(&self, tag: &str) -> Result<(), BoardError> {
         let m = self.unsynced_path(tag);
         crate::record::check_real_parents(self.root(), &m)?;
-        if super::journal::marker_stat(&m).is_err() {
+        if !super::journal::marker_present(&m)? {
             return Ok(());
         }
         self.sync_cursor_dir()?;

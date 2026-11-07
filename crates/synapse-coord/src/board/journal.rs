@@ -365,20 +365,34 @@ pub(crate) fn marker_stat(p: &Path) -> std::io::Result<()> {
     fs::symlink_metadata(p).map(drop)
 }
 
-fn root_sync_pending(root: &Path) -> bool {
-    marker_stat(&root.join(DIRSYNC_PENDING)).is_ok()
+/// Whether a durability marker is set. Only `NotFound` means nothing is owed: any other
+/// lookup failure is returned, because a marker that cannot be observed may still record
+/// an unsynced publication (round 13 of the #928 review).
+pub(crate) fn marker_present(p: &Path) -> Result<bool, BoardError> {
+    match marker_stat(p) {
+        Ok(()) => Ok(true),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(BoardError::Io {
+            path: p.to_path_buf(),
+            source: e,
+        }),
+    }
+}
+
+fn root_sync_pending(root: &Path) -> Result<bool, BoardError> {
+    marker_present(&root.join(DIRSYNC_PENDING))
 }
 
 /// Flush a root change an earlier operation left unsynced (`dirsync.pending`) before this
-/// one reports success; a failure is returned and the marker kept. A stat when nothing is
-/// pending: a change that marks after that stat is not this operation's to flush (its own
+/// one reports success; a failure (of the sync or of the marker lookup itself) is returned
+/// and the marker kept. A stat when nothing is pending: a change that marks after that stat is not this operation's to flush (its own
 /// `publish_root` syncs it), and the marker is checked again under the lock.
 pub(crate) fn reconcile_root(root: &Path) -> Result<(), BoardError> {
-    if !root_sync_pending(root) {
+    if !root_sync_pending(root)? {
         return Ok(());
     }
     let held = RootLock::acquire(root)?;
-    if root_sync_pending(root) {
+    if root_sync_pending(root)? {
         sync_root_locked(root, &held)?;
     }
     Ok(())
