@@ -43,7 +43,10 @@
 //! subdirectory, `BOARD_ID`, the compacted generation) is durable only once the root
 //! directory is synced; every such sync that fails fails the operation (no receipt, no
 //! ACK), and `dirsync.pending` (`DIRSYNC_PENDING`) makes the next writer sync the root
-//! again before it acknowledges anything.
+//! again before it acknowledges anything. The marker's lifecycle (mark, change, sync,
+//! clear) runs under the root-marker lock `<root>/dirsync.lock` ([`RootLock`], innermost
+//! in the lock order `.lock`, then `cursors/<tag>.lock`, then `dirsync.lock`), so an
+//! earlier successful sync never clears the marker of a later change whose sync failed.
 //!
 //! **After a reboot.** `journal.idx` and the id indexes are derived from the journal. A
 //! process crash keeps the page cache, so they stay exact; a power loss can lose unsynced
@@ -287,14 +290,14 @@ pub(crate) fn make_dir(root: &Path, name: &str) -> Result<PathBuf, BoardError> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(e) => return Err(io_err(&d)(e)),
     }
-    // A new subdirectory is a root entry: mark it before the change, so a failed sync is
-    // retried by the next writer (see `dirsync.pending`).
-    mark_root_unsynced(root)?;
-    match fs::create_dir(&d) {
-        Ok(()) => sync_root(root)?,
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
-        Err(e) => return Err(io_err(&d)(e)),
-    }
+    // A new subdirectory is a root entry: marked before the change and synced after it,
+    // under the root-marker lock (`publish_root`), so a failed sync is retried by the next
+    // writer and no other operation's sync can clear the mark in between.
+    publish_root(root, || match fs::create_dir(&d) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+        Err(e) => Err(io_err(&d)(e)),
+    })?;
     match fs::symlink_metadata(&d) {
         Ok(m) if m.file_type().is_dir() => Ok(d),
         _ => Err(refused(&d, RecordRefusal::NotDirectory)),
@@ -307,16 +310,46 @@ pub(crate) fn fsync_dir(d: &Path) -> Result<(), BoardError> {
 }
 
 /// `<root>/dirsync.pending`: an entry of the board root (the journal, `journal.idx`, a
-/// subdirectory, `BOARD_ID`) was created or renamed but the directory sync that makes it
-/// durable has not succeeded yet. A later writer that sees it syncs the root again before
-/// it acknowledges anything (see `Writer::open`), and so does every other durable mutator
-/// (`reconcile_root`: registration, cursors, subscriptions, init, unregister), including a
-/// retry that finds its subdirectory already there; only a successful sync removes it.
-/// The marker is set before such a change where the code can (a subdirectory, `BOARD_ID`,
-/// compaction) and again after a failed sync; it needs no durability of its own, because
-/// what a reboot shows is already on disk, and a stale marker costs one extra directory
-/// sync.
+/// subdirectory, `BOARD_ID`, a compacted generation) was created or renamed but the
+/// directory sync that makes it durable has not succeeded yet. A later writer that sees it
+/// syncs the root again before it acknowledges anything (see `Writer::open`), and so does
+/// every other durable mutator (`reconcile_root`: registration, cursors, subscriptions,
+/// init, unregister), including a retry that finds its subdirectory already there; only a
+/// successful sync removes it. The marker is set before every such change and again after
+/// a failed sync; it needs no durability of its own, because what a reboot shows is already
+/// on disk, and a stale marker costs one extra directory sync.
+///
+/// Its whole lifecycle runs under [`RootLock`]: mark, change and sync of one change
+/// (`publish_root`), and check, sync and removal of a reconciliation. A removal therefore
+/// follows a sync that began after every marked change had finished, so an earlier
+/// successful sync can never clear the marker of a later change whose own sync failed.
 pub(crate) const DIRSYNC_PENDING: &str = "dirsync.pending";
+
+/// `<root>/dirsync.lock`, the lock file of [`RootLock`].
+pub(crate) const DIRSYNC_LOCK: &str = "dirsync.lock";
+
+static ROOT_MARKER: Mutex<()> = Mutex::new(());
+
+/// The root-marker lock: serialises the `dirsync.pending` lifecycle across threads and
+/// processes (see [`DIRSYNC_PENDING`]).
+///
+/// **Lock order:** [`BoardLock`] (`<root>/.lock`), then the tag lock
+/// (`cursors/<tag>.lock`), then `RootLock`. `RootLock` is a leaf: while it is held only the
+/// marker, the root entries of the one change it covers and the root fsync are touched, and
+/// no other lock is taken, so it closes no cycle with the others. It is taken with or
+/// without the outer locks (a reader's `tag_lock` reconciles before its tag lock, compaction
+/// publishes under `BoardLock`), and never held while waiting for anything but the disk.
+pub(crate) struct RootLock(#[allow(dead_code)] FileLock);
+
+impl RootLock {
+    fn acquire(root: &Path) -> Result<RootLock, BoardError> {
+        Ok(RootLock(fcntl_lock(
+            root,
+            &root.join(DIRSYNC_LOCK),
+            &ROOT_MARKER,
+        )?))
+    }
+}
 
 fn root_sync_pending(root: &Path) -> bool {
     fs::symlink_metadata(root.join(DIRSYNC_PENDING)).is_ok()
@@ -324,12 +357,31 @@ fn root_sync_pending(root: &Path) -> bool {
 
 /// Flush a root change an earlier operation left unsynced (`dirsync.pending`) before this
 /// one reports success; a failure is returned and the marker kept. A stat when nothing is
-/// pending.
+/// pending: a change that marks after that stat is not this operation's to flush (its own
+/// `publish_root` syncs it), and the marker is checked again under the lock.
 pub(crate) fn reconcile_root(root: &Path) -> Result<(), BoardError> {
+    if !root_sync_pending(root) {
+        return Ok(());
+    }
+    let held = RootLock::acquire(root)?;
     if root_sync_pending(root) {
-        sync_root(root)?;
+        sync_root_locked(root, &held)?;
     }
     Ok(())
+}
+
+/// Make one root change durable: under [`RootLock`], set `dirsync.pending`, apply
+/// `change`, sync the root. A failed change or sync returns the error with the marker
+/// kept, so the next writer flushes the root before it acknowledges anything.
+fn publish_root<T>(
+    root: &Path,
+    change: impl FnOnce() -> Result<T, BoardError>,
+) -> Result<T, BoardError> {
+    let held = RootLock::acquire(root)?;
+    mark_root_unsynced(root)?;
+    let v = change()?;
+    sync_root_locked(root, &held)?;
+    Ok(v)
 }
 
 /// Set `dirsync.pending` (a no-op when anything already has that name).
@@ -354,11 +406,18 @@ pub(crate) fn create_marker(p: &Path) -> Result<(), BoardError> {
         .map_err(io_err(p))
 }
 
-/// Sync the board root. On success drop `dirsync.pending` (every change made before this
-/// sync is now durable; a change racing with it syncs again itself). On failure leave the
-/// marker (best effort: the sync error is what is returned) so the next writer retries the
-/// flush before it acknowledges.
+/// Sync the board root under [`RootLock`] (see `sync_root_locked`).
 pub(crate) fn sync_root(root: &Path) -> Result<(), BoardError> {
+    let held = RootLock::acquire(root)?;
+    sync_root_locked(root, &held)
+}
+
+/// Sync the board root; the caller holds [`RootLock`]. On success drop `dirsync.pending`:
+/// every change marked before this sync was made under the same lock, so it finished
+/// before the sync began and is now durable. On failure leave the marker (best effort: the
+/// sync error is what is returned) so the next writer retries the flush before it
+/// acknowledges.
+fn sync_root_locked(root: &Path, _held: &RootLock) -> Result<(), BoardError> {
     match fsync_dir(root) {
         Ok(()) => {
             pause("pause-after-root-sync");
@@ -471,20 +530,20 @@ pub(crate) fn ensure_board_id_locked(root: &Path) -> Result<BoardId, BoardError>
     let p = root.join(BOARD_ID_FILE);
     let tmp = root.join(format!("{BOARD_ID_FILE}.tmp{}", std::process::id()));
     let id = BoardId::random().map_err(io_err(Path::new("/dev/urandom")))?;
-    mark_root_unsynced(root)?;
-    {
-        let mut f = crate::record::create_temp(&tmp)?;
-        f.write_all(&encode_board_id(&id)).map_err(io_err(&tmp))?;
-        f.sync_all().map_err(io_err(&tmp))?;
-    }
-    let linked = fs::hard_link(&tmp, &p);
-    let _ = fs::remove_file(&tmp);
-    match linked {
-        Ok(()) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
-        Err(e) => return Err(io_err(&p)(e)),
-    }
-    sync_root(root)?;
+    publish_root(root, || {
+        {
+            let mut f = crate::record::create_temp(&tmp)?;
+            f.write_all(&encode_board_id(&id)).map_err(io_err(&tmp))?;
+            f.sync_all().map_err(io_err(&tmp))?;
+        }
+        let linked = fs::hard_link(&tmp, &p);
+        let _ = fs::remove_file(&tmp);
+        match linked {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+            Err(e) => Err(io_err(&p)(e)),
+        }
+    })?;
     read_board_id(root)?.ok_or(BoardError::BoardIdMissing {
         root: root.to_path_buf(),
     })
@@ -1012,16 +1071,27 @@ impl<'a> Writer<'a> {
         let jp = root.join(JOURNAL);
         let ip = root.join(TABLE);
         refuse_lost_journal(&jp, &ip)?;
-        let (j, jc) = open_rw(root, &jp)?;
-        let (idx, ic) = open_rw(root, &ip)?;
-        // The journal's directory entry must be durable before any ACK. Sync the root when
-        // this open created a file, while the journal is still empty (so a creation whose
-        // sync failed earlier is retried, whoever created it), and while an earlier change
-        // left `dirsync.pending`. A failure refuses the open: nothing is acknowledged.
-        let pending = root_sync_pending(root);
+        // The journal's directory entry must be durable before any ACK. A journal or table
+        // this open creates is published (marked, created, root synced) under `RootLock`.
+        // Otherwise the root is synced while the journal is still empty (so a creation whose
+        // sync failed earlier is retried, whoever created it), or a file appeared after the
+        // check (created by `open_rw` below), and reconciled while an earlier change left
+        // `dirsync.pending`. A failure refuses the open: nothing is acknowledged.
+        let creating = fs::symlink_metadata(&jp).is_err() || fs::symlink_metadata(&ip).is_err();
+        let open = || -> Result<_, BoardError> { Ok((open_rw(root, &jp)?, open_rw(root, &ip)?)) };
+        let ((j, jc), (idx, ic)) = if creating {
+            publish_root(root, open)?
+        } else {
+            open()?
+        };
         let empty = j.metadata().map_err(io_err(&jp))?.len() == 0;
-        if jc || ic || empty || pending {
-            sync_root(root)?;
+        // When `creating`, `publish_root` synced the root, covering every earlier marked change.
+        if !creating {
+            if jc || ic || empty {
+                sync_root(root)?;
+            } else {
+                reconcile_root(root)?;
+            }
         }
         let mut w = Writer {
             board,
@@ -1839,18 +1909,20 @@ impl Board {
             return Err(e);
         }
         let expired = if expire_cursors { lagging } else { Vec::new() };
-        // The renames publish the new generation: mark the root before them and sync it
-        // after, so a failed sync refuses the compaction and the next writer flushes the
+        // The renames publish the new generation: marked before them and synced after, all
+        // under `RootLock` (`publish_root`), so a failed sync refuses the compaction, the
+        // marker survives every other operation's sync, and the next writer flushes the
         // root again before it acknowledges a post into the new journal.
-        mark_root_unsynced(root)?;
-        fs::rename(&jt, &w.jp).map_err(io_err(&w.jp))?;
-        fault("compact-between-renames");
-        fs::rename(&it, &w.ip).map_err(io_err(&w.ip))?;
-        if fault_active("compact-root-sync-eio") {
-            // Test-only: the publication's root sync fails; the marker set above stays.
-            return Err(io_err(root)(std::io::Error::from_raw_os_error(libc::EIO)));
-        }
-        sync_root(root)?;
+        publish_root(root, || {
+            fs::rename(&jt, &w.jp).map_err(io_err(&w.jp))?;
+            fault("compact-between-renames");
+            fs::rename(&it, &w.ip).map_err(io_err(&w.ip))?;
+            if fault_active("compact-root-sync-eio") {
+                // Test-only: the publication's root sync fails; the marker set above stays.
+                return Err(io_err(root)(std::io::Error::from_raw_os_error(libc::EIO)));
+            }
+            Ok(())
+        })?;
         self.trim_indexes(keep_since)?;
         Ok(CompactReport {
             base: keep_since,
