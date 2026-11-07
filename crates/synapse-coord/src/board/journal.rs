@@ -150,7 +150,7 @@ fn stored_boot_id(root: &Path) -> Result<Option<String>, BoardError> {
 /// A board with no journal yet has nothing derived to verify: record this boot so its first
 /// writer does not report a rebuild. Called by `Board::init` under the lock.
 pub(crate) fn mark_boot_if_fresh(root: &Path) -> Result<(), BoardError> {
-    if fs::symlink_metadata(root.join(JOURNAL)).is_err() {
+    if crate::record::lstat(&root.join(JOURNAL)).is_err() {
         if let Some(b) = boot_id() {
             crate::durable_write(root, &root.join(BOOT), format!("{b}\n").as_bytes())?;
         }
@@ -246,12 +246,12 @@ pub(crate) fn open_rw(root: &Path, path: &Path) -> Result<(File, bool), BoardErr
 /// the journal by `rename(2)`, so no legitimate state lacks it while the table names events.
 /// An empty journal under such a table is refused by the tail scan (`Committed`).
 fn refuse_lost_journal(jp: &Path, ip: &Path) -> Result<(), BoardError> {
-    match fs::symlink_metadata(jp) {
+    match crate::record::lstat(jp) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         // Present, or not inspectable: `open_rw` vets and reports it.
         _ => return Ok(()),
     }
-    match fs::symlink_metadata(ip) {
+    match crate::record::lstat(ip) {
         Ok(m) if m.file_type().is_file() && m.len() > 0 => Err(corrupt(
             jp,
             0,
@@ -352,17 +352,11 @@ impl RootLock {
 }
 
 /// Look up a durability marker (`dirsync.pending`, `cursors/<tag>.unsynced`). Test-only
-/// fault injection: `SYNAPSE_COORD_FAULT=marker-stat-eio:<file name>` makes the lookup of
-/// that one marker fail with `EIO` (unset in normal use).
+/// fault injection: `SYNAPSE_COORD_FAULT=marker-stat-eio:<file name>` (or
+/// `stat-eio:<file name>`, see [`crate::record::lstat`]) makes the lookup of that one
+/// marker fail with `EIO` (unset in normal use).
 pub(crate) fn marker_stat(p: &Path) -> std::io::Result<()> {
-    if let Ok(v) = std::env::var("SYNAPSE_COORD_FAULT") {
-        if let (Some(want), Some(name)) = (v.strip_prefix("marker-stat-eio:"), p.file_name()) {
-            if name.to_str() == Some(want) {
-                return Err(std::io::Error::from_raw_os_error(libc::EIO));
-            }
-        }
-    }
-    fs::symlink_metadata(p).map(drop)
+    crate::record::lstat(p).map(drop)
 }
 
 /// Whether a durability marker is set. Only `NotFound` means nothing is owed: any other
@@ -510,7 +504,7 @@ impl BoardLock {
 /// a `.lock` and an operator could mistake one for the other.
 pub(crate) fn refuse_coord_root(root: &Path) -> Result<(), BoardError> {
     for n in [crate::STORE_ID_FILE, "dirs"] {
-        if fs::symlink_metadata(root.join(n)).is_ok() {
+        if crate::record::lstat(&root.join(n)).is_ok() {
             return Err(BoardError::NotABoard {
                 root: root.to_path_buf(),
                 reason: format!("it has {n}, so it is a Crumb coordination store"),
@@ -1520,7 +1514,7 @@ impl<'a> Writer<'a> {
         self.j.sync_data().map_err(io_err(&self.jp))?;
         let mut want: std::collections::BTreeMap<PathBuf, Vec<u64>> = Default::default();
         for d in ["topics", "inbox"] {
-            let Ok(rd) = fs::read_dir(root.join(d)) else {
+            let Ok(rd) = crate::record::list_dir(&root.join(d)) else {
                 continue;
             };
             for ent in rd.filter_map(|e| e.ok()) {
@@ -1583,7 +1577,9 @@ impl<'a> Writer<'a> {
         let root = self.board.root();
         for d in ["topics", "inbox"] {
             let dir = root.join(d);
-            let Ok(rd) = fs::read_dir(&dir) else { continue };
+            let Ok(rd) = crate::record::list_dir(&dir) else {
+                continue;
+            };
             for ent in rd.filter_map(|e| e.ok()) {
                 let p = ent.path();
                 if p.extension().and_then(|x| x.to_str()) != Some("idx") {
@@ -1968,7 +1964,9 @@ impl Board {
         let root = self.root();
         for d in ["topics", "inbox"] {
             let dir = root.join(d);
-            let Ok(rd) = fs::read_dir(&dir) else { continue };
+            let Ok(rd) = crate::record::list_dir(&dir) else {
+                continue;
+            };
             for ent in rd.filter_map(|e| e.ok()) {
                 let p = ent.path();
                 if p.extension().and_then(|x| x.to_str()) != Some("idx") {
@@ -2082,7 +2080,7 @@ impl Board {
         for (d, expect) in [("topics", &expect_topic), ("inbox", &expect_inbox)] {
             let dir = self.root().join(d);
             let mut found: Vec<PathBuf> = Vec::new();
-            if let Ok(rd) = fs::read_dir(&dir) {
+            if let Ok(rd) = crate::record::list_dir(&dir) {
                 for ent in rd.filter_map(|e| e.ok()) {
                     found.push(ent.path());
                 }

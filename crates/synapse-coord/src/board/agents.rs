@@ -114,7 +114,7 @@ impl Board {
     /// Every binding on the board (bounded; a hostile file under `agents/` is refused).
     pub(crate) fn bindings(&self) -> Result<Vec<Binding>, BoardError> {
         let dir = self.root().join("agents");
-        let Ok(rd) = fs::read_dir(&dir) else {
+        let Ok(rd) = crate::record::list_dir(&dir) else {
             return Ok(Vec::new());
         };
         let mut tags = Vec::new();

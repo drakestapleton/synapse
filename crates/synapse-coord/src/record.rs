@@ -135,6 +135,53 @@ pub(crate) fn read_bounded(path: &Path, cap: u64) -> Result<Option<Vec<u8>>, Coo
     Ok(Some(buf))
 }
 
+/// Whether the test-only fault list names this path. `SYNAPSE_COORD_FAULT` (the variable
+/// of every other fault point of this crate, unset in normal use) is read as a
+/// comma-separated list; an item `<kind>:<name>` with one of `kinds` matches a path whose
+/// final component is exactly `<name>`.
+fn fault_names(kinds: &[&str], p: &Path) -> bool {
+    let Ok(v) = std::env::var("SYNAPSE_COORD_FAULT") else {
+        return false;
+    };
+    let Some(name) = p.file_name().and_then(|n| n.to_str()) else {
+        return false;
+    };
+    v.split(',').any(|item| {
+        item.split_once(':')
+            .is_some_and(|(k, n)| n == name && kinds.contains(&k))
+    })
+}
+
+fn injected_eio() -> std::io::Error {
+    std::io::Error::from_raw_os_error(libc::EIO)
+}
+
+/// `lstat` for a lookup whose answer decides what an operation may do (a marker, a
+/// discriminator file, a journal that may be missing). Test-only fault injection:
+/// `SYNAPSE_COORD_FAULT=stat-eio:<name>` makes the lookup of a path named `<name>` fail
+/// with `EIO`; `marker-stat-eio:<name>` (the round-13 spelling) is the same point.
+pub(crate) fn lstat(p: &Path) -> std::io::Result<fs::Metadata> {
+    if fault_names(&["stat-eio", "marker-stat-eio"], p) {
+        return Err(injected_eio());
+    }
+    fs::symlink_metadata(p)
+}
+
+/// `read_dir` for a listing whose completeness decides what an operation may do.
+/// Test-only fault injection: `SYNAPSE_COORD_FAULT=readdir-eio:<name>` makes listing a
+/// directory named `<name>` fail with `EIO`; `readdirent-eio:<name>` lists every real
+/// entry and then yields one entry error (`EIO`), as a failing `getdents` would.
+pub(crate) fn list_dir(
+    dir: &Path,
+) -> std::io::Result<impl Iterator<Item = std::io::Result<fs::DirEntry>>> {
+    if fault_names(&["readdir-eio"], dir) {
+        return Err(injected_eio());
+    }
+    let rd = fs::read_dir(dir)?;
+    let tail = fault_names(&["readdirent-eio"], dir).then(injected_eio);
+    Ok(rd.chain(tail.map(Err)))
+}
+
 /// Refuse to replace `path` unless it is absent or a regular file (a rename would silently
 /// swap a planted FIFO or symlink for a record; refuse instead, like a corrupt record).
 pub(crate) fn check_replaceable(path: &Path) -> Result<(), CoordError> {

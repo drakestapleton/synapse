@@ -239,7 +239,7 @@ pub trait PathOracle: Send + Sync {
 pub struct FsOracle(pub PathBuf);
 impl PathOracle for FsOracle {
     fn exists(&self, rel: &str) -> bool {
-        fs::symlink_metadata(self.0.join(rel)).is_ok()
+        record::lstat(&self.0.join(rel)).is_ok()
     }
 }
 
@@ -820,7 +820,9 @@ fn fault_point(point: &str) {
 /// is not a directory is returned, whatever its type; [`record::read_bounded`] then refuses
 /// a non-regular one without opening it, so a planted FIFO is reported, never read.
 fn collect_json(dir: &Path, out: &mut Vec<PathBuf>) {
-    let Ok(rd) = fs::read_dir(dir) else { return };
+    let Ok(rd) = record::list_dir(dir) else {
+        return;
+    };
     let mut ents: Vec<_> = rd
         .filter_map(|e| e.ok())
         .map(|e| (e.path(), e.file_type().ok()))
