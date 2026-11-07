@@ -30,11 +30,14 @@
 //! unverifiable frame that `journal.idx` names as committed (directly, through a partly
 //! written or undecodable final entry, or because the table is being rebuilt), nor a
 //! journal that ends on a frame boundary before such a frame: that is damage to an
-//! acknowledged event, refused however short it is. A reboot rebuild carries the same
-//! evidence (a partly written final entry counts) into its scan from offset 0. Recovery
-//! changes `journal.idx` only after the tail scan succeeded, so a refused recovery leaves
-//! both files byte for byte as they were and every retry refuses the same way. Readers
-//! never truncate; they stop at the commit point.
+//! acknowledged event, refused however short it is. A table this journal cannot place
+//! (another generation) still proves its last committed id, which every generation a
+//! compaction can leave holds: an empty or missing journal, or one whose frames end short
+//! of that id, is refused too, never rebuilt into an empty table that would reuse the ids.
+//! A reboot rebuild carries the same evidence (a partly written final entry counts) into
+//! its scan from offset 0. Recovery changes `journal.idx` only after the tail scan
+//! succeeded, so a refused recovery leaves both files byte for byte as they were and every
+//! retry refuses the same way. Readers never truncate; they stop at the commit point.
 //!
 //! **Directory syncs.** A new or renamed root entry (the journal, `journal.idx`, a
 //! subdirectory, `BOARD_ID`, the compacted generation) is durable only once the root
@@ -231,6 +234,31 @@ pub(crate) fn open_rw(root: &Path, path: &Path) -> Result<(File, bool), BoardErr
         return Err(refused(path, r));
     }
     Ok((f, created))
+}
+
+/// A missing `journal.log` under a `journal.idx` that holds any bytes (every entry, even a
+/// partly written one, was written only after the frame it names was durable) is a lost
+/// journal, not a fresh board: refused here, before `open_rw` would create an empty journal,
+/// so both files stay as they are and every retry refuses the same way. Compaction replaces
+/// the journal by `rename(2)`, so no legitimate state lacks it while the table names events.
+/// An empty journal under such a table is refused by the tail scan (`Committed`).
+fn refuse_lost_journal(jp: &Path, ip: &Path) -> Result<(), BoardError> {
+    match fs::symlink_metadata(jp) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        // Present, or not inspectable: `open_rw` vets and reports it.
+        _ => return Ok(()),
+    }
+    match fs::symlink_metadata(ip) {
+        Ok(m) if m.file_type().is_file() && m.len() > 0 => Err(corrupt(
+            jp,
+            0,
+            format!(
+                "journal.log is missing but journal.idx ({} bytes) names committed events; refusing",
+                m.len()
+            ),
+        )),
+        _ => Ok(()),
+    }
 }
 
 /// Make `<root>/<name>` a real directory (a symlink or file planted there is refused), then
@@ -958,9 +986,13 @@ enum Committed {
     /// decode). The scan must reach `floor` and verify `more` frames from there.
     Through { floor: u64, more: u64 },
     /// The table names committed frames this journal cannot place (another generation, an
-    /// unreadable first entry): nothing may be cut, but how far they reach is unknown, so a
-    /// journal that ends on a frame boundary is accepted. Distinct from a known floor.
-    Unplaced,
+    /// unreadable first entry): nothing may be cut, and how far they reach in bytes is
+    /// unknown, so a journal that ends on a frame boundary is accepted only when its frames
+    /// reach event `through` (the table's last decodable entry; 0 when none decodes), and
+    /// never with no frame at all. Every generation a compaction leaves (a cut between its
+    /// renames, or a power loss before its root sync) holds that event: it keeps everything
+    /// up to the last committed id, and `keep_since <= last`. Distinct from a known floor.
+    Unplaced { through: u64 },
 }
 
 impl<'a> Writer<'a> {
@@ -974,6 +1006,7 @@ impl<'a> Writer<'a> {
         }
         let jp = root.join(JOURNAL);
         let ip = root.join(TABLE);
+        refuse_lost_journal(&jp, &ip)?;
         let (j, jc) = open_rw(root, &jp)?;
         let (idx, ic) = open_rw(root, &ip)?;
         // The journal's directory entry must be durable before any ACK. Sync the root when
@@ -1099,10 +1132,13 @@ impl<'a> Writer<'a> {
                     // The table belongs to another journal generation (a compaction cut
                     // between its two renames) or is unreadable: rebuild it from the
                     // journal, which is the truth. The old table claimed committed events,
-                    // so nothing may be cut while rebuilding, and it is only replaced once
-                    // the whole journal verified.
+                    // so nothing may be cut while rebuilding, the journal must still reach
+                    // the last of them (see `Committed::Unplaced`), and the table is only
+                    // replaced once the whole journal verified.
                     self.rec.table_rebuilt = true;
-                    self.committed = Committed::Unplaced;
+                    self.committed = Committed::Unplaced {
+                        through: self.last_decodable_id(n)?,
+                    };
                     return self.scan_tail(jlen, Some(0));
                 }
             }
@@ -1159,8 +1195,20 @@ impl<'a> Writer<'a> {
                     more: slots - k,
                 }
             }
-            _ => Committed::Unplaced,
+            _ => Committed::Unplaced { through: le.id },
         })
+    }
+
+    /// The id of the last entry among the first `k` table slots that decodes (0 when none
+    /// does).
+    fn last_decodable_id(&self, mut k: u64) -> Result<u64, BoardError> {
+        while k > 0 {
+            if let Some(e) = self.table_entry(k - 1)? {
+                return Ok(e.id);
+            }
+            k -= 1;
+        }
+        Ok(0)
     }
 
     /// Reconcile bytes after the commit point (see the torn-tail rule above). With
@@ -1177,7 +1225,7 @@ impl<'a> Writer<'a> {
         // Frames verified at or after the evidence floor (see `Committed::Through`).
         let (floor, more) = match self.committed {
             Committed::Through { floor, more } => (floor, more),
-            Committed::Nothing | Committed::Unplaced => (0, 0),
+            Committed::Nothing | Committed::Unplaced { .. } => (0, 0),
         };
         let mut beyond = 0u64;
         while pos < jlen {
@@ -1217,7 +1265,7 @@ impl<'a> Writer<'a> {
                         format!("{reason}, with {torn} bytes after it (more than one frame): not a torn tail; refusing"),
                     ));
                 }
-                if self.rec.table_rebuilt || self.committed == Committed::Unplaced {
+                if self.rec.table_rebuilt || matches!(self.committed, Committed::Unplaced { .. }) {
                     // The old table claimed committed events it cannot place; never cut
                     // anything while rebuilding it.
                     return Err(corrupt(
@@ -1254,6 +1302,22 @@ impl<'a> Writer<'a> {
                     "journal ends at {pos}, before the committed events journal.idx names (through offset {floor}, {more} more); refusing"
                 ),
             ));
+        }
+        if let Committed::Unplaced { through } = self.committed {
+            // The table proves committed events this journal cannot place. An empty journal
+            // (or one whose frames stop short of the table's last committed id) lost them:
+            // accepting it would truncate the table and hand those ids out again. Refused
+            // before anything is changed, so a retry refuses the same way.
+            let reached = self.pending.last().map_or(self.last, |p| p.e.id);
+            if reached == 0 || reached < through {
+                return Err(corrupt(
+                    &self.jp,
+                    pos,
+                    format!(
+                        "journal ends at {pos} with its last event at id {reached}, but journal.idx names committed events through id {through}; refusing"
+                    ),
+                ));
+            }
         }
         self.tail_end = pos;
         if let Some(k) = table_len {
