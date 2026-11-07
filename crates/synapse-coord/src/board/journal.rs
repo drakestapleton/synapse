@@ -334,8 +334,13 @@ pub(crate) fn reconcile_root(root: &Path) -> Result<(), BoardError> {
 
 /// Set `dirsync.pending` (a no-op when anything already has that name).
 fn mark_root_unsynced(root: &Path) -> Result<(), BoardError> {
-    let p = root.join(DIRSYNC_PENDING);
-    if fs::symlink_metadata(&p).is_ok() {
+    create_marker(&root.join(DIRSYNC_PENDING))
+}
+
+/// Create the empty marker file `p` unless something already has that name (never
+/// following a link). Markers need no durability of their own (see `DIRSYNC_PENDING`).
+pub(crate) fn create_marker(p: &Path) -> Result<(), BoardError> {
+    if fs::symlink_metadata(p).is_ok() {
         return Ok(());
     }
     OpenOptions::new()
@@ -344,9 +349,9 @@ fn mark_root_unsynced(root: &Path) -> Result<(), BoardError> {
         .truncate(false)
         .mode(0o644)
         .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
-        .open(&p)
+        .open(p)
         .map(drop)
-        .map_err(io_err(&p))
+        .map_err(io_err(p))
 }
 
 /// Sync the board root. On success drop `dirsync.pending` (every change made before this

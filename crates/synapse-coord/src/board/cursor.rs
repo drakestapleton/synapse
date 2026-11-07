@@ -13,10 +13,17 @@
 //! (written without fsync: losing it only re-delivers). Reading from `acked` after a crash
 //! returns every unprocessed event again (at-least-once, stable ids); reading from
 //! `delivered` returns only what was never handed out.
+//!
+//! Every durable cursor write sets `cursors/<tag>.unsynced` before its rename and removes
+//! it only after the directory sync succeeded (under the tag lock). A delivery that finds
+//! the cursor already there (a retry of a first delivery whose sync failed, or any write a
+//! crash cut before its sync) flushes `cursors/` while that marker is set, before it
+//! reports the batch; with nothing pending it needs no directory sync.
 
 use super::frame::{as_string, as_u64, compact, j_list, key_hash, num_u64, str_list, H_THREAD};
 use super::journal::{
-    ensure_dir, fcntl_lock, fsync_dir, inbox_file, read_ids_after, topic_file, FileLock, Snapshot,
+    create_marker, ensure_dir, fcntl_lock, fsync_dir, inbox_file, read_ids_after, topic_file,
+    FileLock, Snapshot,
 };
 use super::{
     validate_name, validate_tag, Board, BoardError, Event, Me, MAX_READ_LIMIT, MAX_SUBSCRIPTIONS,
@@ -193,7 +200,33 @@ impl Board {
         o.set("expired", if c.expired { J::True } else { J::False });
         let mut data = compact(&o);
         data.push(b'\n');
+        // Mark before the rename, clear after the directory sync (see the module docs): a
+        // failed sync or a crash in between leaves the obligation for the next delivery.
+        let m = self.unsynced_path(tag);
+        crate::record::check_real_parents(self.root(), &m)?;
+        create_marker(&m)?;
         crate::durable_write(self.root(), &self.cursor_path(tag), &data)?;
+        // Best effort: a leftover marker only costs the next delivery one directory sync.
+        let _ = std::fs::remove_file(&m);
+        Ok(())
+    }
+
+    /// `cursors/<tag>.unsynced`: a durable write of this tag's cursor may have been renamed
+    /// into place without a successful directory sync.
+    fn unsynced_path(&self, tag: &str) -> PathBuf {
+        self.root().join("cursors").join(format!("{tag}.unsynced"))
+    }
+
+    /// Discharge a cursor publication an earlier write left unsynced (caller holds the tag
+    /// lock): flush `cursors/` and drop the marker. A failure is returned, the marker kept.
+    fn flush_unsynced_cursor(&self, tag: &str) -> Result<(), BoardError> {
+        let m = self.unsynced_path(tag);
+        crate::record::check_real_parents(self.root(), &m)?;
+        if std::fs::symlink_metadata(&m).is_err() {
+            return Ok(());
+        }
+        self.sync_cursor_dir()?;
+        let _ = std::fs::remove_file(&m);
         Ok(())
     }
 
@@ -388,6 +421,11 @@ impl Board {
             c.acked = after;
             c.delivered = after;
             self.write_cursor(&me.tag, &c)?;
+        } else {
+            // Already there, but not necessarily durable: a first delivery (or any cursor
+            // write) may have renamed it into place and then failed, or died before, its
+            // directory sync. Discharge that before reporting the batch.
+            self.flush_unsynced_cursor(&me.tag)?;
         }
         if b.through > c.delivered {
             self.write_delivered_hint(&me.tag, b.through)?;

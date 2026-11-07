@@ -801,7 +801,7 @@ fn durable_write(root: &Path, path: &Path, data: &[u8]) -> Result<(), CoordError
     // sync leaves the new record visible, so a caller with an "already applied" path (a
     // retry that finds the record as it wanted it and writes nothing) must sync the
     // directory again itself before it reports success (the board's `ack`,
-    // `subscribe`, compaction).
+    // `subscribe`, `deliver` of an existing cursor, compaction).
     fsync_dir(dd)
 }
 
