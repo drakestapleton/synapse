@@ -36,9 +36,9 @@ mod blockdev_a2_suite;
 mod blockdev_tests;
 pub mod chunk;
 pub mod codec;
-pub mod git_bridge;
 #[cfg(test)]
 mod g2_tests;
+pub mod git_bridge;
 #[cfg(test)]
 mod group_tests;
 #[cfg(test)]
