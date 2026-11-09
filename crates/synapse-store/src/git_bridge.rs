@@ -1012,7 +1012,8 @@ mod tests {
         );
         s.checkpoint_and_compact(1_000).unwrap();
         drop(s);
-        let s = sealed(RecoveryPolicy::StrictFailClosed).expect("strict accepts the compacted store");
+        let s =
+            sealed(RecoveryPolicy::StrictFailClosed).expect("strict accepts the compacted store");
         assert!(s.git_bridge_repo(&repo).is_none());
         let _ = std::fs::remove_dir_all(&dir);
     }
