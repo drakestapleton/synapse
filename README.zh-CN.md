@@ -1,3 +1,7 @@
+<!-- languages -->
+[English](README.md) · **简体中文**
+<!-- /languages -->
+
 <!-- github-native-navigation -->
 [源码](https://github.com/aien-dev/synapse) · [逐步讲解](TEACHING.md) · [重放凭证](TEACHING-REPLAY.txt) · [议题](https://github.com/aien-dev/synapse/issues)
 <!-- /github-native-navigation -->
